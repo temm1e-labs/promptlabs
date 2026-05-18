@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 
 import { api } from "./client";
 import type {
@@ -10,6 +11,26 @@ import type {
   PromptVersion,
   Run,
 } from "./types";
+
+export type CrossProjectExperiment = ExperimentSummary & {
+  project_id: string;
+  project_name: string;
+  created_at: string;
+};
+
+export type SettingsStatus = {
+  default_model: string;
+  providers: Record<string, boolean>;
+  cache_ttl_days: number;
+  max_concurrent_requests: number;
+  request_timeout_s: number;
+  defaults: {
+    eval_size: number;
+    train_ratio: number;
+    max_iterations: number;
+    budget_usd: number;
+  };
+};
 
 export function useProjects() {
   return useQuery({
@@ -30,7 +51,11 @@ export function useCreateProject() {
   return useMutation({
     mutationFn: (input: { name: string; description?: string | null }) =>
       api.post<Project>("/projects", input),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["projects"] }),
+    onSuccess: (p) => {
+      toast.success(`Created project "${p.name}"`);
+      qc.invalidateQueries({ queryKey: ["projects"] });
+    },
+    onError: (e) => toast.error(`Could not create project: ${(e as Error).message}`),
   });
 }
 
@@ -38,7 +63,11 @@ export function useDeleteProject() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => api.delete<void>(`/projects/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["projects"] }),
+    onSuccess: () => {
+      toast.success("Project deleted");
+      qc.invalidateQueries({ queryKey: ["projects"] });
+    },
+    onError: (e) => toast.error(`Could not delete: ${(e as Error).message}`),
   });
 }
 
@@ -66,7 +95,62 @@ export function useCreateExperiment(projectId: string) {
   return useMutation({
     mutationFn: (body: ExperimentCreate) =>
       api.post<Experiment>(`/projects/${projectId}/experiments`, body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["projects", projectId, "experiments"] }),
+    onSuccess: () => {
+      toast.success("Experiment started");
+      qc.invalidateQueries({ queryKey: ["projects", projectId, "experiments"] });
+      qc.invalidateQueries({ queryKey: ["experiments", "all"] });
+    },
+    onError: (e) => toast.error(`Could not start experiment: ${(e as Error).message}`),
+  });
+}
+
+export function useCancelExperiment(experimentId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<Experiment>(`/experiments/${experimentId}/cancel`),
+    onSuccess: () => {
+      toast.success("Experiment cancelled — current step will finish then stop");
+      qc.invalidateQueries({ queryKey: ["experiments", experimentId] });
+    },
+    onError: (e) => toast.error(`Could not cancel: ${(e as Error).message}`),
+  });
+}
+
+export function useDeleteExperiment(experimentId: string, projectId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.delete<void>(`/experiments/${experimentId}`),
+    onSuccess: () => {
+      toast.success("Experiment deleted");
+      qc.invalidateQueries({ queryKey: ["projects", projectId, "experiments"] });
+      qc.invalidateQueries({ queryKey: ["experiments", experimentId] });
+      qc.invalidateQueries({ queryKey: ["experiments", "all"] });
+    },
+    onError: (e) => toast.error(`Could not delete: ${(e as Error).message}`),
+  });
+}
+
+export function useAllExperiments() {
+  return useQuery({
+    queryKey: ["experiments", "all"],
+    queryFn: () => api.get<CrossProjectExperiment[]>("/experiments"),
+    refetchInterval: 3000,
+  });
+}
+
+export function useSettingsStatus() {
+  return useQuery({
+    queryKey: ["settings", "status"],
+    queryFn: () => api.get<SettingsStatus>("/settings/status"),
+    staleTime: 60_000,
+  });
+}
+
+export function useClearCache() {
+  return useMutation({
+    mutationFn: () => api.post<{ cleared: number }>("/settings/cache/clear"),
+    onSuccess: (r) => toast.success(`Cleared ${r.cleared} cached responses`),
+    onError: (e) => toast.error(`Could not clear cache: ${(e as Error).message}`),
   });
 }
 

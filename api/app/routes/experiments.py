@@ -131,6 +131,48 @@ async def list_experiments_for_project(
     return summaries
 
 
+@router.get("/experiments", response_model=list[dict[str, Any]])
+async def list_all_experiments(
+    db: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    """All experiments across projects, most recent first. Includes project name."""
+    from app.models.project import Project
+
+    stmt = (
+        select(Experiment, Project.name)
+        .join(Project, Project.id == Experiment.project_id)
+        .order_by(Experiment.created_at.desc())
+        .limit(100)
+    )
+    rows = (await db.execute(stmt)).all()
+    out: list[dict[str, Any]] = []
+    for e, project_name in rows:
+        best_stmt = select(Run.mean_score).where(
+            Run.experiment_id == e.id,
+            Run.split == "holdout",
+        )
+        scores = [s for (s,) in (await db.execute(best_stmt)).all() if s is not None]
+        best = max(scores) if scores else None
+        out.append(
+            {
+                "id": e.id,
+                "project_id": e.project_id,
+                "project_name": project_name,
+                "name": e.name,
+                "intent": e.intent,
+                "status": e.status.value,
+                "current_iteration": e.current_iteration,
+                "cost_usd": e.cost_usd,
+                "budget_usd": e.budget_usd,
+                "target_models": list(e.target_models),
+                "optimization_objectives": list(e.optimization_objectives),
+                "best_score": best,
+                "created_at": e.created_at.isoformat(),
+            }
+        )
+    return out
+
+
 @router.get("/experiments/{experiment_id}", response_model=ExperimentOut)
 async def get_experiment(
     experiment_id: str,
@@ -164,6 +206,117 @@ async def accept_iteration(
     e.status = ExperimentStatus.ACCEPTED
     await db.flush()
     return _to_out(e)
+
+
+@router.get("/experiments/{experiment_id}/best-prompt", response_model=dict[str, Any])
+async def get_best_prompt(
+    experiment_id: str,
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Return the prompt + metadata that downstream services should use.
+
+    Priority:
+      1. The iteration the user explicitly accepted (`accepted_iteration`).
+      2. The iteration with the highest mean holdout score.
+      3. The most recent iteration if no holdout scores exist yet (e.g. mid-run).
+
+    Designed for production consumption: stable JSON shape, no SQLAlchemy types leaked.
+    """
+    exp = await db.get(Experiment, experiment_id)
+    if exp is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="experiment_not_found")
+
+    version: PromptVersion | None = None
+    selection_reason: str
+
+    if exp.accepted_iteration is not None:
+        accepted_stmt = (
+            select(PromptVersion)
+            .where(
+                PromptVersion.experiment_id == experiment_id,
+                PromptVersion.iteration == exp.accepted_iteration,
+            )
+            .limit(1)
+        )
+        version = (await db.execute(accepted_stmt)).scalar_one_or_none()
+        selection_reason = "accepted"
+
+    if version is None:
+        # Pick the iteration with the highest mean HOLDOUT score
+        holdout_stmt = (
+            select(Run.iteration, Run.prompt_version_id, Run.mean_score)
+            .where(Run.experiment_id == experiment_id, Run.split == "holdout")
+            .order_by(Run.mean_score.desc().nulls_last())
+            .limit(1)
+        )
+        row = (await db.execute(holdout_stmt)).first()
+        if row is not None:
+            version = await db.get(PromptVersion, row.prompt_version_id)
+            selection_reason = f"best_holdout (iter {row.iteration}, score {row.mean_score})"
+        else:
+            # Fallback: most recent prompt version
+            recent_stmt = (
+                select(PromptVersion)
+                .where(PromptVersion.experiment_id == experiment_id)
+                .order_by(PromptVersion.iteration.desc())
+                .limit(1)
+            )
+            version = (await db.execute(recent_stmt)).scalar_one_or_none()
+            selection_reason = "most_recent (no holdout scores yet)"
+
+    if version is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail="no_prompt_version_for_experiment"
+        )
+
+    return {
+        "experiment_id": experiment_id,
+        "experiment_name": exp.name,
+        "iteration": version.iteration,
+        "prompt": version.content,
+        "source": version.source.value,
+        "selection_reason": selection_reason,
+        "experiment_status": exp.status.value,
+        "version_id": version.id,
+        "created_at": version.created_at.isoformat(),
+    }
+
+
+@router.post("/experiments/{experiment_id}/cancel", response_model=ExperimentOut)
+async def cancel_experiment(
+    experiment_id: str,
+    db: AsyncSession = Depends(get_session),
+) -> ExperimentOut:
+    """Cooperative cancel: flip status to `cancelled`. The orchestrator checks this
+    at each iteration boundary and exits cleanly (in-flight LLM calls finish first)."""
+    e = await db.get(Experiment, experiment_id)
+    if e is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="experiment_not_found")
+    terminal = {
+        ExperimentStatus.CONVERGED,
+        ExperimentStatus.OVERFIT,
+        ExperimentStatus.EXHAUSTED,
+        ExperimentStatus.FAILED,
+        ExperimentStatus.ACCEPTED,
+        ExperimentStatus.CANCELLED,
+    }
+    if e.status in terminal:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail=f"already {e.status.value}")
+    e.status = ExperimentStatus.CANCELLED
+    e.failure_reason = "cancelled by user"
+    await db.flush()
+    return _to_out(e)
+
+
+@router.delete("/experiments/{experiment_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_experiment(
+    experiment_id: str,
+    db: AsyncSession = Depends(get_session),
+) -> None:
+    e = await db.get(Experiment, experiment_id)
+    if e is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="experiment_not_found")
+    await db.delete(e)
 
 
 @router.get("/experiments/{experiment_id}/prompt-versions", response_model=list[dict[str, Any]])

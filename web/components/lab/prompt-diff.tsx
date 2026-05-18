@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 
+import { CodeBlock } from "@/components/ui/code-block";
 import { cn } from "@/lib/utils";
 
 type Edit = {
@@ -27,7 +28,7 @@ export function PromptDiff({
   const [showFull, setShowFull] = useState(false);
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 min-w-0">
       <div className="flex items-center justify-between">
         <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
           diff · {applied ?? 0} applied{skipped ? ` · ${skipped} skipped` : ""}
@@ -50,18 +51,14 @@ export function PromptDiff({
           </div>
         )}
       </div>
-      {showFull && (
-        <pre className="overflow-x-auto rounded-md border border-border bg-muted/30 p-3 font-mono text-[11px] leading-relaxed">
-          {current}
-        </pre>
-      )}
+      {showFull && <CodeBlock content={current} label="full prompt" />}
     </div>
   );
 }
 
 function EditCard({ edit }: { edit: Edit }) {
   return (
-    <div className="rounded-md border border-border bg-card/50 p-2.5">
+    <div className="rounded-md border border-border bg-card/50 p-2.5 min-w-0">
       <div className="flex items-baseline gap-2">
         <span
           className={cn(
@@ -83,17 +80,17 @@ function EditCard({ edit }: { edit: Edit }) {
       </div>
       <p className="mt-1.5 text-xs text-muted-foreground">{edit.reason}</p>
       {edit.anchor && (
-        <div className="mt-2 flex items-start gap-1.5 rounded bg-[var(--score-bad)]/8 px-2 py-1">
+        <div className="mt-2 flex items-start gap-1.5 rounded bg-[var(--score-bad)]/8 px-2 py-1 min-w-0">
           <ChevronRight className="mt-0.5 h-3 w-3 shrink-0 text-[var(--score-bad)]" />
-          <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[11px] text-[var(--score-bad)]">
+          <pre className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-[11px] text-[var(--score-bad)] min-w-0 flex-1">
             {edit.anchor}
           </pre>
         </div>
       )}
       {edit.new_text && (
-        <div className="mt-1 flex items-start gap-1.5 rounded bg-[var(--score-good)]/8 px-2 py-1">
+        <div className="mt-1 flex items-start gap-1.5 rounded bg-[var(--score-good)]/8 px-2 py-1 min-w-0">
           <ChevronRight className="mt-0.5 h-3 w-3 shrink-0 text-[var(--score-good)]" />
-          <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-[11px] text-[var(--score-good)]">
+          <pre className="overflow-x-auto whitespace-pre-wrap break-words font-mono text-[11px] text-[var(--score-good)] min-w-0 flex-1">
             {edit.new_text}
           </pre>
         </div>

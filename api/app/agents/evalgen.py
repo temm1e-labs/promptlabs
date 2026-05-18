@@ -27,11 +27,21 @@ from app.schemas.common import PromptVariable, RubricCriterion
 
 class GeneratedEvalItem(BaseModel):
     label: str = Field(description="3-8 word human-readable name for this test case.")
-    input_vars: dict[str, str] = Field(
+    input_text: str | None = Field(
+        default=None,
         description=(
-            "Map of {{variable_name}} → value. Every key must match a declared prompt variable. "
-            "Provide realistic, concrete values — not placeholders."
-        )
+            "PRIMARY field for the test input. For single-variable prompts (the common case), "
+            "set this to the realistic value that should be substituted into the prompt's "
+            "{{variable}} placeholder. For multi-variable prompts, leave null and use input_vars."
+        ),
+    )
+    input_vars: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "FOR MULTI-VARIABLE PROMPTS ONLY: map of {{variable_name}} → value with every "
+            "declared variable populated. Keys must match exactly (case-sensitive). For "
+            "single-variable prompts, prefer `input_text` instead."
+        ),
     )
     expected_output: str | None = Field(
         default=None,
@@ -92,11 +102,12 @@ _SYSTEM = """You are designing an evaluation harness for a prompt that is being 
 optimized. Your output drives both rubric scoring and test-case selection.
 
 Hard rules:
-1. EVERY test case's `input_vars` dict MUST have EXACTLY THESE KEYS (no more, no fewer)
-   — they are listed under "Required input_vars keys" below. Do not invent synonyms
-   ("email" vs "email_content" is a hard fail). Do not drop any required key. If the
-   prompt declares N variables, every test case has exactly those N keys, with the same
-   spelling and case.
+1. The TEST INPUT for each case MUST be populated. Use one of:
+   (a) `input_text` (PREFERRED for single-variable prompts) — a single string with the
+       realistic value that should be substituted into the prompt's {{variable}} placeholder.
+   (b) `input_vars` (ONLY for prompts with 2+ variables) — full {key: value} dict with
+       every declared variable.
+   NEVER leave both empty. NEVER put the test data only in `label` or `expected_output`.
 2. Test cases must be DIVERSE: include common cases, edge cases (empty/long/multilingual/
    formatting traps), and adversarial cases (inputs that probe failure modes).
 3. The rubric must have 3-6 criteria, each with a clear `definition` (one sentence) and a
@@ -135,8 +146,40 @@ def _build_user_message(
         )
         or "  (no variables declared)"
     )
-    example_input_vars = "{" + ", ".join(f'"{k}": "..."' for k in declared_keys) + "}"
-    keys_csv = ", ".join(f'"{k}"' for k in declared_keys) or "(none)"
+
+    if len(declared_keys) <= 1:
+        which_field = (
+            f"Use `input_text` (a SINGLE STRING) — it will be substituted into "
+            f"{{{{{declared_keys[0]}}}}} if declared." if declared_keys else
+            "Use `input_text` (a SINGLE STRING) — there are no declared variables."
+        )
+        example_item = (
+            "{\n"
+            '  "label": "Common emergency case",\n'
+            '  "input_text": "<realistic test input — the actual string to test against>",\n'
+            '  "input_vars": {},\n'
+            '  "expected_output": "<ground truth, or null for subjective tasks>",\n'
+            '  "tags": ["common"]\n'
+            "}"
+        )
+    else:
+        keys_csv = ", ".join(f'"{k}"' for k in declared_keys)
+        which_field = (
+            f"Use `input_vars` — the prompt has {len(declared_keys)} variables: {keys_csv}. "
+            f"Every test case's input_vars MUST contain ALL of these keys."
+        )
+        example_input_vars = (
+            "{" + ", ".join(f'"{k}": "...value..."' for k in declared_keys) + "}"
+        )
+        example_item = (
+            "{\n"
+            '  "label": "Realistic case name",\n'
+            '  "input_text": null,\n'
+            f'  "input_vars": {example_input_vars},\n'
+            '  "expected_output": "<ground truth, or null>",\n'
+            '  "tags": ["common"]\n'
+            "}"
+        )
 
     issues_block = (
         f"\nUser-reported failure modes (write items that probe these):\n{known_issues}\n"
@@ -148,9 +191,8 @@ def _build_user_message(
         f"Task intent:\n{intent}\n\n"
         f'Prompt template (v0):\n"""\n{prompt_v0}\n"""\n\n'
         f"Declared variables:\n{vars_block}\n\n"
-        f"Required input_vars keys for EVERY test case (EXACT spelling, case-sensitive):\n"
-        f"  {keys_csv}\n\n"
-        f"Each test case's input_vars MUST have shape: {example_input_vars}\n\n"
+        f"How to populate the test input for each case:\n  {which_field}\n\n"
+        f"Concrete example for ONE item:\n{example_item}\n\n"
         f"Optimization objectives → rubric guidance:\n{_objectives_section(objectives)}\n"
         f"{issues_block}\n"
         f"Generate exactly {eval_size} test cases. Mix ~60% common, ~25% edge, ~15% adversarial.\n"
@@ -158,33 +200,45 @@ def _build_user_message(
     )
 
 
-def _remap_input_vars(
-    item_vars: dict[str, str],
+def _reconcile_item(
+    item: GeneratedEvalItem,
     declared_keys: list[str],
 ) -> dict[str, str] | None:
-    """Reconcile LLM-generated keys with declared variable names.
+    """Return the reconciled input_vars dict, or None if irrecoverable.
 
-    1. Exact match: return as-is.
-    2. Case-insensitive match: rename.
-    3. Same count + ambiguous names: positional remap (declared order ↔ item order).
-       Mostly catches synonym substitution (e.g. "email" instead of "email_content"
-       when the prompt has a single variable).
-    4. Otherwise: None (caller drops the item).
+    Strategy (most permissive first):
+      1. input_vars exact-match declared keys → use as-is.
+      2. input_vars case-insensitive match → rename.
+      3. input_vars same-count, different keys → positional remap.
+      4. input_vars empty but input_text present → map input_text to first declared var.
+      5. input_vars empty AND input_text empty → drop.
     """
     declared = set(declared_keys)
-    keys = set(item_vars.keys())
-    if keys == declared:
-        return item_vars
+    item_vars = item.input_vars or {}
 
-    # Case-insensitive
-    lower_to_actual = {k.lower(): k for k in item_vars}
-    if {k.lower() for k in declared_keys} == set(lower_to_actual.keys()):
-        return {dk: item_vars[lower_to_actual[dk.lower()]] for dk in declared_keys}
+    # (1) exact match
+    if item_vars and set(item_vars.keys()) == declared:
+        return dict(item_vars)
 
-    # Positional fallback for same-count mismatches (common when len == 1)
-    if len(item_vars) == len(declared_keys) and len(declared_keys) >= 1:
+    # (2) case-insensitive
+    if item_vars:
+        lower_to_actual = {k.lower(): k for k in item_vars}
+        if {k.lower() for k in declared_keys} == set(lower_to_actual.keys()):
+            return {dk: item_vars[lower_to_actual[dk.lower()]] for dk in declared_keys}
+
+    # (3) positional
+    if item_vars and len(item_vars) == len(declared_keys) and len(declared_keys) >= 1:
         item_keys = list(item_vars.keys())
         return {declared_keys[i]: item_vars[item_keys[i]] for i in range(len(declared_keys))}
+
+    # (4) fall back to flat input_text → first declared var
+    if item.input_text and len(declared_keys) >= 1:
+        result = {declared_keys[0]: item.input_text}
+        # Optionally fill remaining vars from input_vars if some keys overlap
+        for k in declared_keys[1:]:
+            if k in item_vars:
+                result[k] = item_vars[k]
+        return result
 
     return None
 
@@ -193,29 +247,23 @@ def _filter_items(
     items: list[GeneratedEvalItem],
     declared_vars: list[str],
 ) -> list[GeneratedEvalItem]:
-    """Reconcile each item's input_vars with the declared prompt variables.
+    """Reconcile each item's input data with the declared prompt variables.
 
-    Items whose keys can't be reconciled are dropped (logged for visibility).
+    Items whose inputs can't be reconciled are dropped (logged for visibility).
     """
     kept: list[GeneratedEvalItem] = []
     for item in items:
-        remapped = _remap_input_vars(item.input_vars, declared_vars)
-        if remapped is None:
+        reconciled = _reconcile_item(item, declared_vars)
+        if reconciled is None:
             log.debug(
                 "evalgen.item_dropped",
                 label=item.label,
-                provided=sorted(item.input_vars.keys()),
+                provided_vars=sorted((item.input_vars or {}).keys()),
+                has_input_text=bool(item.input_text),
                 declared=declared_vars,
             )
             continue
-        if remapped is not item.input_vars:
-            log.debug(
-                "evalgen.item_remapped",
-                label=item.label,
-                provided=sorted(item.input_vars.keys()),
-                declared=declared_vars,
-            )
-        kept.append(item.model_copy(update={"input_vars": remapped}))
+        kept.append(item.model_copy(update={"input_vars": reconciled}))
     return kept
 
 

@@ -121,7 +121,8 @@ export type ExperimentStatus =
   | "overfit"
   | "exhausted"
   | "failed"
-  | "accepted";
+  | "accepted"
+  | "cancelled";
 
 export type Model = {
   id: string;

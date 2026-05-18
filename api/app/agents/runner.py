@@ -1,7 +1,15 @@
 """Runner agent — executes a prompt template across eval items on a target model.
 
-Render the template with each item's input_vars, dispatch the LLM call with bounded
-concurrency, record latency + cost per item. No scoring happens here — that's Judge.
+Two execution modes (auto-detected per prompt):
+  1. **Templated** — prompt contains {{var}} placeholders. Substitute and send as a
+     single user message. Use-case: classification, extraction, single-shot tasks.
+  2. **Chat-structured** — prompt contains NO placeholders. Treat the prompt as a
+     system message; the eval item supplies the user turn via a `user_input` variable
+     (falls back to the first var value if absent). Use-case: pasted agent system
+     prompts, Vinfast-style callbot prompts, anything where the whole prompt IS the
+     instructions and the variation is the user's turn.
+
+Either way: no scoring here — that's Judge.
 """
 
 from __future__ import annotations
@@ -10,6 +18,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from app.core import providers, template
 from app.core.logging import log
@@ -21,6 +30,34 @@ class RunItemInput:
 
     item_id: str
     input_vars: dict[str, object]
+
+
+def build_messages(
+    prompt_template: str, input_vars: dict[str, object]
+) -> tuple[list[dict[str, Any]], str]:
+    """Return (messages, display_text) for a given prompt template + vars.
+
+    - If the template has {{var}} placeholders → single user message with substitutions.
+    - Otherwise → [system: prompt, user: user_input / first var / empty].
+
+    `display_text` is a human-readable rendering used for storage & judge context.
+    """
+    if template.has_variables(prompt_template):
+        rendered = template.render(prompt_template, input_vars)
+        return [{"role": "user", "content": rendered}], rendered
+
+    user_msg_raw = input_vars.get("user_input") or input_vars.get("input")
+    if user_msg_raw is None and input_vars:
+        user_msg_raw = next(iter(input_vars.values()))
+    user_msg = str(user_msg_raw or "")
+    messages = [
+        {"role": "system", "content": prompt_template},
+        {"role": "user", "content": user_msg},
+    ]
+    display = (
+        f"[SYSTEM]\n{prompt_template}\n\n[USER]\n{user_msg}"
+    )
+    return messages, display
 
 
 @dataclass
@@ -57,18 +94,18 @@ async def _run_one(
     progress: ProgressCallback | None,
 ) -> RunItemResult:
     async with semaphore:
-        rendered = template.render(prompt_template, item.input_vars)
+        messages, display = build_messages(prompt_template, item.input_vars)
         start = time.perf_counter()
         try:
             result = await providers.complete(
                 model=target_model,
-                messages=[{"role": "user", "content": rendered}],
+                messages=messages,
                 temperature=temperature,
             )
             latency_ms = int((time.perf_counter() - start) * 1000)
             item_result = RunItemResult(
                 item_id=item.item_id,
-                rendered_prompt=rendered,
+                rendered_prompt=display,
                 actual_output=result.content,
                 latency_ms=latency_ms,
                 cost_usd=result.cost_usd,
@@ -86,7 +123,7 @@ async def _run_one(
             )
             item_result = RunItemResult(
                 item_id=item.item_id,
-                rendered_prompt=rendered,
+                rendered_prompt=display,
                 actual_output="",
                 latency_ms=latency_ms,
                 cost_usd=0.0,

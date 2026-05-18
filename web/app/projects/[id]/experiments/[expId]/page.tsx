@@ -1,17 +1,26 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useMemo } from "react";
+import { Square, Trash2 } from "lucide-react";
 
 import { ScoreTrajectory, type TrajectoryPoint } from "@/components/charts/score-trajectory";
 import { TrainHoldoutGap, type GapPoint } from "@/components/charts/train-holdout-gap";
 import { PromptDiff } from "@/components/lab/prompt-diff";
 import { SSERail } from "@/components/lab/sse-rail";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { CodeBlock } from "@/components/ui/code-block";
 import { Separator } from "@/components/ui/separator";
-import { useExperiment, usePromptVersions, useRuns } from "@/lib/api/hooks";
+import {
+  useCancelExperiment,
+  useDeleteExperiment,
+  useExperiment,
+  usePromptVersions,
+  useRuns,
+} from "@/lib/api/hooks";
 import { formatCost, formatScore, scoreBand } from "@/lib/utils";
 import type { ExperimentStatus, PromptVersion, Run } from "@/lib/api/types";
 
@@ -24,15 +33,34 @@ const STATUS_VARIANT: Record<ExperimentStatus, "default" | "good" | "mid" | "bad
   overfit: "mid",
   exhausted: "mid",
   failed: "bad",
+  cancelled: "outline",
 };
+
+const RUNNING_STATUSES: ExperimentStatus[] = ["pending", "running"];
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export default function ExperimentPage() {
   const { id: projectId, expId } = useParams<{ id: string; expId: string }>();
+  const router = useRouter();
   const { data: exp } = useExperiment(expId);
   const { data: versions } = usePromptVersions(expId);
   const { data: runs } = useRuns(expId);
+  const cancelMut = useCancelExperiment(expId);
+  const deleteMut = useDeleteExperiment(expId, projectId);
+  const isRunning = exp ? RUNNING_STATUSES.includes(exp.status) : false;
+  const canDelete = exp && !isRunning;
+
+  const onStop = async () => {
+    if (!confirm("Stop this experiment? In-flight LLM calls will finish first.")) return;
+    await cancelMut.mutateAsync();
+  };
+
+  const onDelete = async () => {
+    if (!confirm("Delete this experiment and all its runs? This cannot be undone.")) return;
+    await deleteMut.mutateAsync();
+    router.push(`/projects/${projectId}`);
+  };
 
   const trajectory = useMemo(() => buildTrajectory(runs), [runs]);
   const gap = useMemo(() => buildGap(trajectory), [trajectory]);
@@ -44,7 +72,7 @@ export default function ExperimentPage() {
 
   return (
     <div className="flex h-[calc(100vh-3rem)] gap-0 -m-6 lg:-mr-8">
-      <div className="flex-1 overflow-y-auto px-8 py-6">
+      <div className="min-w-0 flex-1 overflow-y-auto px-8 py-6">
         <nav className="mb-6 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
           <Link href="/" className="hover:text-foreground">
             projects
@@ -79,6 +107,28 @@ export default function ExperimentPage() {
             <Stat label="cost" value={exp ? `${formatCost(exp.cost_usd)} / ${formatCost(exp.budget_usd)}` : "—"} />
             <Separator orientation="vertical" className="h-10" />
             {exp && <Badge variant={STATUS_VARIANT[exp.status]}>{exp.status}</Badge>}
+            {isRunning && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onStop}
+                disabled={cancelMut.isPending}
+              >
+                <Square className="h-3 w-3" />
+                {cancelMut.isPending ? "Stopping…" : "Stop"}
+              </Button>
+            )}
+            {canDelete && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={onDelete}
+                disabled={deleteMut.isPending}
+                aria-label="Delete experiment"
+              >
+                <Trash2 className="h-3 w-3" />
+              </Button>
+            )}
           </div>
         </header>
 
@@ -203,9 +253,7 @@ function IterationCard({ version, runs }: { version: PromptVersion; runs: Run[] 
           skipped={version.diff.skipped}
         />
       ) : (
-        <pre className="overflow-x-auto rounded-md border border-border bg-muted/30 p-3 font-mono text-[11px] leading-relaxed">
-          {version.content}
-        </pre>
+        <CodeBlock content={version.content} label="prompt" />
       )}
       {runs.length > 0 && (
         <div className="mt-4 grid gap-2 md:grid-cols-2">

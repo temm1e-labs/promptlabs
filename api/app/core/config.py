@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     max_concurrent_requests: int = 8
     cache_ttl_s: int = 60 * 60 * 24 * 30  # 30 days
 
+    # Deployment / API auth — set this in production to require a bearer token
+    # on every request. Leave unset for local dev.
+    api_key: str | None = None
+    cors_origins: list[str] | None = None  # comma-separated; allow_origin_regex by default
+
 
 settings = Settings()
 

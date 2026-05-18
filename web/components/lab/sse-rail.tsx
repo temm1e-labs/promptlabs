@@ -15,6 +15,7 @@ const ICON: Record<string, string> = {
   "loop.finished": "■",
   "loop.failed": "!",
   "writer.completed": "✎",
+  "writer.auto_wrapped": "⮊",
   "evalgen.completed": "𝛴",
   "iteration.started": "→",
   "iteration.completed": "✓",
@@ -24,47 +25,67 @@ const ICON: Record<string, string> = {
   "optimizer.noop": "·",
 };
 
+const TERMINAL_EVENTS = new Set(["loop.finished", "loop.failed"]);
+const TRACKED_EVENTS = [
+  "loop.started",
+  "loop.finished",
+  "loop.failed",
+  "writer.completed",
+  "writer.auto_wrapped",
+  "evalgen.completed",
+  "iteration.started",
+  "iteration.completed",
+  "run.started",
+  "run.completed",
+  "optimizer.completed",
+  "optimizer.noop",
+];
+
 export function SSERail({ experimentId, apiUrl }: { experimentId: string; apiUrl: string }) {
   const [events, setEvents] = useState<SSEMessage[]>([]);
+  const [closed, setClosed] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
+    // Reset between experiments so we don't carry events across IDs
+    setEvents([]);
+    setClosed(false);
+
+    // Keep a SET of dedupe keys so re-replay on accidental reconnect doesn't pile up
+    const seen = new Set<string>();
+
     const url = `${apiUrl}/experiments/${experimentId}/stream`;
     const es = new EventSource(url);
+    esRef.current = es;
 
     const handler = (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data) as SSEMessage;
+        // Dedupe by (type + timestamp) — the server replays history on reconnect
+        const key = `${data.type}::${data.timestamp}`;
+        if (seen.has(key)) return;
+        seen.add(key);
         setEvents((prev) => [...prev.slice(-200), data]);
+
+        // Terminal event → close the stream so the browser doesn't reconnect & re-replay
+        if (TERMINAL_EVENTS.has(data.type)) {
+          es.close();
+          esRef.current = null;
+          setClosed(true);
+        }
       } catch {
         // ignore parse errors
       }
     };
 
-    // Subscribe to every event type we care about (and the generic 'message')
-    const allTypes = [
-      "loop.started",
-      "loop.finished",
-      "loop.failed",
-      "writer.completed",
-      "evalgen.completed",
-      "iteration.started",
-      "iteration.completed",
-      "run.started",
-      "run.completed",
-      "optimizer.completed",
-      "optimizer.noop",
-    ];
-    allTypes.forEach((t) => es.addEventListener(t, handler as EventListener));
+    TRACKED_EVENTS.forEach((t) => es.addEventListener(t, handler as EventListener));
     es.onmessage = handler;
 
-    es.onerror = () => {
-      // best-effort: browser will auto-reconnect
-    };
-
     return () => {
-      allTypes.forEach((t) => es.removeEventListener(t, handler as EventListener));
+      TRACKED_EVENTS.forEach((t) => es.removeEventListener(t, handler as EventListener));
       es.close();
+      esRef.current = null;
     };
   }, [experimentId, apiUrl]);
 
@@ -77,10 +98,16 @@ export function SSERail({ experimentId, apiUrl }: { experimentId: string; apiUrl
 
   return (
     <aside className="hidden h-full w-72 shrink-0 border-l border-border bg-card/30 lg:flex lg:flex-col">
-      <div className="border-b border-border px-4 py-3">
+      <div className="flex items-center justify-between border-b border-border px-4 py-3">
         <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
-          live stream
+          {closed ? "stream · ended" : "stream · live"}
         </div>
+        <div
+          className={cn(
+            "h-1.5 w-1.5 rounded-full",
+            closed ? "bg-muted-foreground/40" : "animate-pulse bg-[var(--score-good)]",
+          )}
+        />
       </div>
       <div ref={containerRef} className="flex-1 overflow-y-auto px-3 py-2 font-mono text-[11px]">
         {events.length === 0 ? (

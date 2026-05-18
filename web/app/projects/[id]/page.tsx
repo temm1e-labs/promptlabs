@@ -20,6 +20,7 @@ const STATUS_VARIANT: Record<ExperimentStatus, "default" | "good" | "mid" | "bad
   overfit: "mid",
   exhausted: "mid",
   failed: "bad",
+  cancelled: "outline",
 };
 
 export default function ProjectPage() {

@@ -29,6 +29,7 @@ from app.agents import judge as judge_agent
 from app.agents import optimizer as optimizer_agent
 from app.agents import runner as runner_agent
 from app.agents import writer as writer_agent
+from app.agents.writer import WriterResult
 from app.core.config import settings
 from app.core.db import SessionLocal
 from app.core.logging import log
@@ -37,6 +38,7 @@ from app.models.evalset import EvalItem, EvalSet, Split
 from app.models.experiment import Experiment, ExperimentStatus
 from app.models.prompt import PromptSource, PromptVersion
 from app.models.run import Run, RunResult, RunStatus
+from app.schemas.common import PromptVariable
 
 # ─── helpers ──────────────────────────────────────────────────────────────
 
@@ -55,6 +57,54 @@ async def _accumulate_cost(db: AsyncSession, experiment: Experiment, delta: floa
     experiment.cost_usd = float(experiment.cost_usd) + float(delta)
     await db.flush()
     return experiment.cost_usd < float(experiment.budget_usd)
+
+
+async def _check_cancelled(db: AsyncSession, experiment_id: str) -> bool:
+    """Re-query the experiment's status — true if user requested a cancel."""
+    fresh = await db.execute(
+        select(Experiment.status).where(Experiment.id == experiment_id)
+    )
+    current_status = fresh.scalar_one_or_none()
+    return current_status == ExperimentStatus.CANCELLED
+
+
+def _declare_user_input_if_no_variables(
+    writer_result: WriterResult,
+) -> tuple[WriterResult, bool]:
+    """When Writer's prompt has no {{var}} placeholders, declare a virtual `user_input`
+    variable. This DOES NOT modify the prompt text — the prompt is preserved verbatim.
+
+    The Runner detects placeholder-less prompts at execution time and sends them as a
+    [system: prompt, user: user_input] chat structure. This cleanly supports full
+    agent system prompts (the common warm-mode case) without polluting the prompt itself.
+
+    Returns (writer_result, was_declared).
+    """
+    if writer_result.output.variables or "{{" in writer_result.output.prompt:
+        return writer_result, False
+
+    new_output = writer_result.output.model_copy(
+        update={
+            "variables": [
+                PromptVariable(
+                    name="user_input",
+                    description="The user message / query to test the prompt against.",
+                    example_value="Hello, I need help with my issue.",
+                )
+            ],
+            "rationale": (
+                (writer_result.output.rationale or "")
+                + "\n\n[PromptLabs: prompt has no {{var}} placeholders → treating as a "
+                "system message; EvalGen will generate `user_input` values as test cases.]"
+            ).strip(),
+        }
+    )
+    return (
+        WriterResult(
+            output=new_output, cost_usd=writer_result.cost_usd, cache_hit=writer_result.cache_hit
+        ),
+        True,
+    )
 
 
 # ─── prompt + evalset persistence ─────────────────────────────────────────
@@ -263,11 +313,27 @@ def _train_plateaued(train_means: list[float], delta: float = 0.01) -> bool:
     return (max(window) - min(window)) < delta
 
 
-def _holdout_declining(holdout_means: list[float]) -> bool:
-    """Decline when holdout mean drops over the most recent 2 iterations."""
-    if len(holdout_means) < 3:
+def _overfitting(
+    train_means: list[float],
+    holdout_means: list[float],
+    min_holdout_drop: float = 0.04,
+    min_gap: float = 0.05,
+) -> bool:
+    """True overfit signal — distinct from ceiling-noise.
+
+    Requires BOTH:
+      1. Holdout dropped at least `min_holdout_drop` over the last 3 iterations
+         (catches material regression, ignores ±1-2pp jitter from small eval sets).
+      2. Current train minus holdout gap >= `min_gap` (catches the actual overfit pattern:
+         train memorizing while holdout falls — not both lines wobbling together).
+    """
+    if len(train_means) < 3 or len(holdout_means) < 3:
         return False
-    return holdout_means[-1] < holdout_means[-2] < holdout_means[-3]
+    holdout_drop = holdout_means[-3] - holdout_means[-1]
+    if holdout_drop < min_holdout_drop:
+        return False
+    current_gap = train_means[-1] - holdout_means[-1]
+    return current_gap >= min_gap
 
 
 # ─── failure sampling for the optimizer ─────────────────────────────────
@@ -373,6 +439,18 @@ async def run_experiment(
                 )
                 source = PromptSource.COLD
 
+            writer_result, was_wrapped = _declare_user_input_if_no_variables(writer_result)
+            if was_wrapped:
+                await _emit(
+                    experiment_id,
+                    "writer.auto_wrapped",
+                    reason=(
+                        "prompt has no {{var}} placeholders — runner will send as "
+                        "system+user chat"
+                    ),
+                    added_variable="user_input",
+                )
+
             ok = await _accumulate_cost(db, experiment, writer_result.cost_usd)
             v0 = await _persist_prompt(
                 db,
@@ -475,6 +553,9 @@ async def run_experiment(
             final_status: ExperimentStatus = ExperimentStatus.EXHAUSTED
 
             for iteration in range(1, experiment.max_iterations + 1):
+                if await _check_cancelled(db, experiment_id):
+                    await _emit(experiment_id, "loop.finished", status="cancelled")
+                    return
                 experiment.current_iteration = iteration
                 await db.commit()
                 await _emit(experiment_id, "iteration.started", iteration=iteration)
@@ -600,7 +681,7 @@ async def run_experiment(
                 current_prompt_version = new_version
 
                 # 3d. Convergence checks
-                if _holdout_declining(holdout_means):
+                if _overfitting(train_means, holdout_means):
                     final_status = ExperimentStatus.OVERFIT
                     break
                 if _train_plateaued(train_means):

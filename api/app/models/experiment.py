@@ -24,6 +24,7 @@ class ExperimentStatus(enum.StrEnum):
     EXHAUSTED = "exhausted"
     FAILED = "failed"
     ACCEPTED = "accepted"
+    CANCELLED = "cancelled"
 
 
 class OptimizationObjective(enum.StrEnum):

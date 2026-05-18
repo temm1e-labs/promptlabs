@@ -1,23 +1,26 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
+import { AgentConfigPicker } from "@/components/experiments/agent-config-picker";
 import { ModelPicker } from "@/components/experiments/model-picker";
 import { ObjectivePicker } from "@/components/experiments/objective-picker";
+import { PRESETS, PresetPicker, type RunPreset } from "@/components/experiments/preset-picker";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { useCreateExperiment } from "@/lib/api/hooks";
+import { useCreateExperiment, useModels } from "@/lib/api/hooks";
 import { cn } from "@/lib/utils";
-import type { OptimizationObjective } from "@/lib/api/types";
+import type { AgentConfig, OptimizationObjective } from "@/lib/api/types";
 
 export default function NewExperimentPage() {
   const { id: projectId } = useParams<{ id: string }>();
   const router = useRouter();
   const mut = useCreateExperiment(projectId);
+  const { data: groups } = useModels();
 
   const [mode, setMode] = useState<"cold" | "warm">("cold");
   const [name, setName] = useState("");
@@ -27,19 +30,43 @@ export default function NewExperimentPage() {
   const [knownIssues, setKnownIssues] = useState("");
   const [objectives, setObjectives] = useState<OptimizationObjective[]>(["accuracy"]);
   const [targets, setTargets] = useState<string[]>([]);
-  const [budget, setBudget] = useState(5);
-  const [maxIter, setMaxIter] = useState(8);
-  const [evalSize, setEvalSize] = useState(30);
+  const [labDefault, setLabDefault] = useState("");
+  const [agentConfig, setAgentConfig] = useState<AgentConfig>({});
+
+  const [presetId, setPresetId] = useState<RunPreset["id"]>("standard");
+  const preset = useMemo(() => PRESETS.find((p) => p.id === presetId), [presetId]);
+  const [customBudget, setCustomBudget] = useState(10);
+  const [customMaxIter, setCustomMaxIter] = useState(10);
+  const [customEvalSize, setCustomEvalSize] = useState(50);
+
+  // Default the lab model to first provider's default
+  useMemo(() => {
+    if (!labDefault && groups) {
+      const defaultModel = groups.flatMap((g) => g.models).find((m) => m.is_default);
+      if (defaultModel) setLabDefault(defaultModel.id);
+    }
+  }, [groups, labDefault]);
+
+  const budget_usd = preset ? preset.budget_usd : customBudget;
+  const max_iterations = preset ? preset.max_iterations : customMaxIter;
+  const eval_size = preset ? preset.eval_size : customEvalSize;
 
   const canSubmit =
     name.trim() &&
     intent.trim() &&
     targets.length > 0 &&
     objectives.length > 0 &&
+    labDefault.length > 0 &&
     (mode === "cold" || existingPrompt.trim().length > 0);
 
   const submit = async () => {
     if (!canSubmit) return;
+    const finalAgentConfig: AgentConfig = {
+      writer_model: agentConfig.writer_model || labDefault,
+      evalgen_model: agentConfig.evalgen_model || labDefault,
+      judge_model: agentConfig.judge_model || labDefault,
+      optimizer_model: agentConfig.optimizer_model || labDefault,
+    };
     const exp = await mut.mutateAsync({
       name: name.trim(),
       mode,
@@ -49,9 +76,10 @@ export default function NewExperimentPage() {
       known_issues: mode === "warm" ? knownIssues.trim() || null : null,
       optimization_objectives: objectives,
       target_models: targets,
-      budget_usd: budget,
-      max_iterations: maxIter,
-      eval_size: evalSize,
+      agent_config: finalAgentConfig,
+      budget_usd,
+      max_iterations,
+      eval_size,
       train_ratio: 0.7,
     });
     router.push(`/projects/${projectId}/experiments/${exp.id}`);
@@ -65,7 +93,8 @@ export default function NewExperimentPage() {
         </p>
         <h1 className="text-2xl font-semibold tracking-tight">Configure the loop</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Define what you&apos;re optimizing, on which models, and how aggressively.
+          Cold start from intent, or warm start from an existing prompt. Pick what to optimize for,
+          which models to test against, and how aggressively the loop should run.
         </p>
       </header>
 
@@ -148,7 +177,7 @@ export default function NewExperimentPage() {
                   id="issues"
                   value={knownIssues}
                   onChange={(e) => setKnownIssues(e.target.value)}
-                  placeholder="e.g. It sometimes hallucinates a category. It's too verbose for simple cases. It misclassifies multilingual inputs."
+                  placeholder="e.g. It hallucinates a category sometimes. Misclassifies multilingual inputs."
                 />
               </div>
             </>
@@ -160,56 +189,80 @@ export default function NewExperimentPage() {
           <ObjectivePicker selected={objectives} onChange={setObjectives} />
         </Card>
 
-        <Card className="p-6">
-          <ModelPicker selected={targets} onChange={setTargets} />
-        </Card>
+        <Card className="p-6 space-y-5">
+          <div>
+            <Label className="mb-3 block">4. Target models — what we test against</Label>
+            <ModelPicker selected={targets} onChange={setTargets} label="" />
+          </div>
 
-        <Card className="p-6">
-          <Label className="mb-3 block">4. Run budget</Label>
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="budget">Cost cap (USD)</Label>
-              <Input
-                id="budget"
-                type="number"
-                min={0.1}
-                step={0.1}
-                value={budget}
-                onChange={(e) => setBudget(Number(e.target.value))}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="maxiter">Max iterations</Label>
-              <Input
-                id="maxiter"
-                type="number"
-                min={1}
-                max={50}
-                value={maxIter}
-                onChange={(e) => setMaxIter(Number(e.target.value))}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="evalsize">Eval set size</Label>
-              <Input
-                id="evalsize"
-                type="number"
-                min={4}
-                max={200}
-                value={evalSize}
-                onChange={(e) => setEvalSize(Number(e.target.value))}
-              />
-            </div>
+          <div className="border-t border-border pt-5">
+            <Label className="mb-3 block">5. Agent models — what drives the loop</Label>
+            <AgentConfigPicker
+              labDefault={labDefault}
+              onLabDefault={setLabDefault}
+              config={agentConfig}
+              onConfig={setAgentConfig}
+            />
           </div>
         </Card>
 
-        <div className="flex items-center justify-end gap-3">
-          <Button variant="ghost" onClick={() => router.back()}>
-            Cancel
-          </Button>
-          <Button onClick={submit} disabled={!canSubmit || mut.isPending}>
-            {mut.isPending ? "Starting..." : "Start loop"}
-          </Button>
+        <Card className="p-6">
+          <Label className="mb-3 block">6. Run preset</Label>
+          <PresetPicker selectedId={presetId} onSelect={setPresetId} />
+          {presetId === "custom" && (
+            <div className="mt-4 grid gap-4 border-t border-border pt-4 md:grid-cols-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="budget">Cost cap (USD)</Label>
+                <Input
+                  id="budget"
+                  type="number"
+                  min={0.1}
+                  step={0.1}
+                  value={customBudget}
+                  onChange={(e) => setCustomBudget(Number(e.target.value))}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="maxiter">Max iterations</Label>
+                <Input
+                  id="maxiter"
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={customMaxIter}
+                  onChange={(e) => setCustomMaxIter(Number(e.target.value))}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="evalsize">Eval set size</Label>
+                <Input
+                  id="evalsize"
+                  type="number"
+                  min={4}
+                  max={200}
+                  value={customEvalSize}
+                  onChange={(e) => setCustomEvalSize(Number(e.target.value))}
+                />
+              </div>
+            </div>
+          )}
+        </Card>
+
+        <div className="flex items-center justify-between gap-3">
+          <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            <span>budget {budget_usd}$ · max {max_iterations} iter · {eval_size} items</span>
+            {targets.length > 0 && (
+              <span> · {targets.length} target model{targets.length === 1 ? "" : "s"}</span>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <Button variant="ghost" onClick={() => router.back()}>
+              Cancel
+            </Button>
+            <Button onClick={submit} disabled={!canSubmit || mut.isPending}>
+              {mut.isPending ? "Starting..." : "Start loop"}
+            </Button>
+          </div>
         </div>
       </div>
     </div>
