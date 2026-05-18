@@ -59,7 +59,27 @@ function colorFor(idx: number): string {
 // renders Areas with a tuple dataKey as a filled envelope between the two).
 type FlatRow = Record<string, number | [number, number] | null | undefined>;
 
-function flatten(data: TrajectoryPoint[], models: string[]): FlatRow[] {
+// Skip the CI band when it would be a degenerate zero-width range — Recharts
+// can handle [1.0, 1.0] inconsistently in a ComposedChart and that has been
+// observed to suppress the Line render that sits on top of it.
+function bandOrNull(value: number | null, ci: number | null | undefined): [number, number] | null {
+  if (value == null || ci == null || ci <= 0) return null;
+  return [Math.max(0, value - ci), Math.min(1, value + ci)];
+}
+
+function flattenSingle(data: TrajectoryPoint[]): FlatRow[] {
+  return data.map((p) => ({
+    iteration: p.iteration,
+    train: p.train,
+    holdout: p.holdout,
+    train_n: p.train_n,
+    holdout_n: p.holdout_n,
+    train_band: bandOrNull(p.train, p.train_ci),
+    holdout_band: bandOrNull(p.holdout, p.holdout_ci),
+  }));
+}
+
+function flattenMulti(data: TrajectoryPoint[], models: string[]): FlatRow[] {
   return data.map((p) => {
     const row: FlatRow = { iteration: p.iteration };
     for (const m of models) {
@@ -68,25 +88,6 @@ function flatten(data: TrajectoryPoint[], models: string[]): FlatRow[] {
       row[`holdout::${m}`] = s?.holdout ?? null;
       row[`train_n::${m}`] = s?.train_n ?? undefined;
       row[`holdout_n::${m}`] = s?.holdout_n ?? undefined;
-    }
-    // Aggregated keys for the single-model rendering path
-    row["train"] = p.train;
-    row["holdout"] = p.holdout;
-    if (p.train != null && p.train_ci != null) {
-      row["train_band"] = [
-        Math.max(0, p.train - p.train_ci),
-        Math.min(1, p.train + p.train_ci),
-      ];
-    } else {
-      row["train_band"] = null;
-    }
-    if (p.holdout != null && p.holdout_ci != null) {
-      row["holdout_band"] = [
-        Math.max(0, p.holdout - p.holdout_ci),
-        Math.min(1, p.holdout + p.holdout_ci),
-      ];
-    } else {
-      row["holdout_band"] = null;
     }
     return row;
   });
@@ -133,7 +134,7 @@ export function ScoreTrajectory({
   models?: string[];
 }) {
   const multi = models.length > 1;
-  const flat = flatten(data, models);
+  const flat = multi ? flattenMulti(data, models) : flattenSingle(data);
 
   return (
     <div className="h-56 w-full">
@@ -155,6 +156,7 @@ export function ScoreTrajectory({
             tickLine={false}
             axisLine={false}
             tickFormatter={(v: number) => `${Math.round(v * 100)}%`}
+            padding={{ top: 8, bottom: 4 }}
           />
           <Tooltip
             contentStyle={{
