@@ -3,7 +3,25 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import BaseModel
 
-from app.core.providers import complete
+from app.core.providers import _normalize_temperature, complete
+
+
+def test_normalize_temperature_overrides_gemini_3_below_one() -> None:
+    """Gemini 3 family flakes at temperature < 1.0 (LiteLLM warns about this).
+    Force the recommended 1.0 for those models only; other models unaffected.
+    """
+    # Gemini 3 family — clamped UP to 1.0
+    assert _normalize_temperature("gemini/gemini-3-flash-preview", 0.0) == 1.0
+    assert _normalize_temperature("gemini/gemini-3-flash-preview", 0.7) == 1.0
+    assert _normalize_temperature("gemini/gemini-3.1-pro-preview", 0.5) == 1.0
+    # Already at or above 1.0 — no change
+    assert _normalize_temperature("gemini/gemini-3-flash-preview", 1.0) == 1.0
+    assert _normalize_temperature("gemini/gemini-3-flash-preview", 1.5) == 1.5
+    # Other models — pass-through, untouched
+    assert _normalize_temperature("anthropic/claude-sonnet-4-6", 0.0) == 0.0
+    assert _normalize_temperature("anthropic/claude-sonnet-4-6", 0.7) == 0.7
+    assert _normalize_temperature("openai/gpt-5", 0.5) == 0.5
+    assert _normalize_temperature("gemini/gemini-2.5-flash", 0.7) == 0.7
 
 
 class _Schema(BaseModel):

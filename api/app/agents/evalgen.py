@@ -250,8 +250,16 @@ def _objectives_section(objectives: list[str]) -> str:
     return "\n".join(lines) or "- accuracy: include a 'correctness' criterion."
 
 
-def _which_field_block(declared_keys: list[str]) -> tuple[str, str]:
-    """Return (which_field_instruction, example_item_json) given declared vars."""
+def _which_field_block(variables: list[PromptVariable]) -> tuple[str, str]:
+    """Return (which_field_instruction, example_item_json) given declared vars.
+
+    For multi-variable prompts the instruction is heavily directive about the
+    exact keys to use, and labels each variable as "user input" or "context"
+    based on a name heuristic. SOTA models would have followed the looser
+    instruction; weaker preview models need the extra spoonfeeding.
+    """
+    declared_keys = [v.name for v in variables]
+
     if len(declared_keys) <= 1:
         which_field = (
             f"Use `input_text` (a SINGLE STRING) — it will be substituted into "
@@ -269,17 +277,34 @@ def _which_field_block(declared_keys: list[str]) -> tuple[str, str]:
             "}"
         )
     else:
-        keys_csv = ", ".join(f'"{k}"' for k in declared_keys)
+        input_idx = _pick_input_var(variables)
+        keys_bulleted = "\n".join(f'      • "{k}"' for k in declared_keys)
+        role_lines = []
+        for i, v in enumerate(variables):
+            role = "USER INPUT (vary this per item)" if i == input_idx else (
+                "CONTEXT (use example_value or a similar realistic value — usually constant)"
+            )
+            role_lines.append(f"      • {v.name} → {role}")
+        roles_block = "\n".join(role_lines)
         which_field = (
-            f"Use `input_vars` — the prompt has {len(declared_keys)} variables: {keys_csv}. "
-            f"Every test case's input_vars MUST contain ALL of these keys."
+            f"Use `input_vars` (a JSON object). The prompt has {len(declared_keys)} variables.\n\n"
+            f"    CRITICAL — input_vars must contain EXACTLY these keys, no more, no less:\n"
+            f"{keys_bulleted}\n\n"
+            f"    Do NOT invent new keys (no 'query', 'user_query', 'inquiry', etc).\n"
+            f"    Do NOT omit any of the keys above.\n"
+            f"    Each variable's role:\n"
+            f"{roles_block}"
         )
-        example_input_vars = "{" + ", ".join(f'"{k}": "...value..."' for k in declared_keys) + "}"
+        example_input_vars_lines = "\n".join(
+            f'    "{v.name}": "<realistic value for {v.name}>"' for v in variables
+        )
         example_item = (
             "{\n"
             '  "label": "Realistic case name",\n'
             '  "input_text": null,\n'
-            f'  "input_vars": {example_input_vars},\n'
+            '  "input_vars": {\n'
+            f"{example_input_vars_lines}\n"
+            "  },\n"
             '  "expected_output": "<ground truth, or null>",\n'
             '  "tags": ["common"]\n'
             "}"
@@ -303,7 +328,7 @@ def _build_user_single(
         )
         or "  (no variables declared)"
     )
-    which_field, example_item = _which_field_block(declared_keys)
+    which_field, example_item = _which_field_block(variables)
     issues_block = (
         f"\nUser-reported failure modes (write items that probe these):\n{known_issues}\n"
         if known_issues
@@ -374,7 +399,7 @@ def _build_user_batch(
         )
         or "  (no variables declared)"
     )
-    which_field, example_item = _which_field_block(declared_keys)
+    which_field, example_item = _which_field_block(variables)
 
     return (
         f"Task intent:\n{intent}\n\n"
@@ -409,7 +434,7 @@ def _build_user_topup(
         )
         or "  (no variables declared)"
     )
-    which_field, example_item = _which_field_block(declared_keys)
+    which_field, example_item = _which_field_block(variables)
     avoid_block = "\n".join(f"  - {label}" for label in existing_labels[:60])
 
     return (

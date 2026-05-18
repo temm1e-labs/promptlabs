@@ -102,6 +102,23 @@ def _model_max_output_tokens(model: str) -> int | None:
     return None
 
 
+def _normalize_temperature(model: str, temperature: float) -> float:
+    """Apply known model-family temperature constraints.
+
+    Gemini 3 family models recommend temperature=1.0 — LiteLLM logs:
+        "Setting temperature < 1.0 for Gemini 3 models can cause infinite
+        loops, degraded reasoning performance, and failure on complex tasks."
+
+    This is opt-in behavior for one specific family; SOTA models (Claude
+    Sonnet, GPT-5, etc.) are unaffected. Worse models stop self-sabotaging
+    when callers pass our usual 0.5–0.7 default.
+    """
+    lower = model.lower()
+    if ("gemini-3" in lower or "gemini/gemini-3" in lower) and temperature < 1.0:
+        return 1.0
+    return temperature
+
+
 async def _call_litellm(
     model: str,
     messages: list[dict[str, Any]],
@@ -111,7 +128,7 @@ async def _call_litellm(
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "temperature": temperature,
+        "temperature": _normalize_temperature(model, temperature),
         "timeout": settings.request_timeout_s,
     }
     # Pass max_tokens ONLY when the model's native max is known, so providers that
