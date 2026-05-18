@@ -205,9 +205,10 @@ async def _judge_one(
 
 
 async def _execute_on_split(
-    db: AsyncSession,
-    experiment: Experiment,
-    prompt_version: PromptVersion,
+    *,
+    experiment_id: str,
+    prompt_version_id: str,
+    prompt_content: str,
     target_model: str,
     items: list[EvalItem],
     iteration: int,
@@ -215,95 +216,107 @@ async def _execute_on_split(
     rubric: list[dict[str, Any]],
     judge_model: str,
 ) -> tuple[Run, float]:
-    """Run the prompt against `items` on `target_model`, judge each, persist a Run."""
-    run = Run(
-        experiment_id=experiment.id,
-        prompt_version_id=prompt_version.id,
-        target_model=target_model,
-        split=split,
-        iteration=iteration,
-        status=RunStatus.RUNNING,
-    )
-    db.add(run)
-    await db.flush()
-    await _emit(
-        experiment.id,
-        "run.started",
-        run_id=run.id,
-        target_model=target_model,
-        split=split.value,
-        iteration=iteration,
-        n_items=len(items),
-    )
+    """Run the prompt against `items` on `target_model`, judge each, persist a Run.
 
-    runner_result = await runner_agent.run(
-        prompt_template=prompt_version.content,
-        items=[
-            runner_agent.RunItemInput(item_id=item.id, input_vars=item.input_vars)
-            for item in items
-        ],
-        target_model=target_model,
-        max_concurrency=settings.max_concurrent_requests,
-    )
+    Opens its OWN AsyncSession because this function is invoked concurrently
+    (one task per target model). SQLAlchemy AsyncSession is not safe to share
+    across asyncio tasks — concurrent flush/add operations on a single session
+    raise MissingGreenlet. Each parallel run gets its own session, persists its
+    own Run + RunResults, then commits independently.
 
-    await _emit(
-        experiment.id,
-        "judge.started",
-        run_id=run.id,
-        target_model=target_model,
-        split=split.value,
-        iteration=iteration,
-        n_items=len(items),
-        judge_model=judge_model,
-    )
-
-    item_by_id = {item.id: item for item in items}
-    scored = await asyncio.gather(
-        *[
-            _judge_one(
-                eval_item=item_by_id[r.item_id],
-                run_item=r,
-                rubric=rubric,
-                judge_model=judge_model,
-            )
-            for r in runner_result.items
-        ]
-    )
-
-    # Persist RunResults + accumulate cost
-    score_total = 0.0
-    n_scored = 0
-    total_run_cost = runner_result.total_cost_usd
-    total_judge_cost = 0.0
-    for s in scored:
-        db.add(
-            RunResult(
-                run_id=run.id,
-                eval_item_id=s.eval_item.id,
-                actual_output=s.run_item.actual_output,
-                scores=s.judge.scores,
-                judge_reasoning=s.judge.reasoning,
-                mean_score=s.judge.mean_score,
-                latency_ms=s.run_item.latency_ms,
-                cost_usd=s.run_item.cost_usd + s.judge.cost_usd,
-                extras={
-                    "per_objective": s.judge.per_objective,
-                    "cache_hit": s.run_item.cache_hit,
-                    "runner_error": s.run_item.error,
-                },
-            )
+    `items` is a list of detached EvalItem instances loaded by the caller's
+    session; only already-loaded column values are read (id, input_vars,
+    expected_output), so the detachment is safe with expire_on_commit=False.
+    """
+    async with SessionLocal() as db:
+        run = Run(
+            experiment_id=experiment_id,
+            prompt_version_id=prompt_version_id,
+            target_model=target_model,
+            split=split,
+            iteration=iteration,
+            status=RunStatus.RUNNING,
         )
-        score_total += s.judge.mean_score
-        n_scored += 1
-        total_judge_cost += s.judge.cost_usd
+        db.add(run)
+        await db.flush()
+        await _emit(
+            experiment_id,
+            "run.started",
+            run_id=run.id,
+            target_model=target_model,
+            split=split.value,
+            iteration=iteration,
+            n_items=len(items),
+        )
 
-    mean = score_total / n_scored if n_scored > 0 else 0.0
-    run.cost_usd = total_run_cost + total_judge_cost
-    run.mean_score = mean
-    run.status = RunStatus.COMPLETED
-    await db.flush()
+        runner_result = await runner_agent.run(
+            prompt_template=prompt_content,
+            items=[
+                runner_agent.RunItemInput(item_id=item.id, input_vars=item.input_vars)
+                for item in items
+            ],
+            target_model=target_model,
+            max_concurrency=settings.max_concurrent_requests,
+        )
+
+        await _emit(
+            experiment_id,
+            "judge.started",
+            run_id=run.id,
+            target_model=target_model,
+            split=split.value,
+            iteration=iteration,
+            n_items=len(items),
+            judge_model=judge_model,
+        )
+
+        item_by_id = {item.id: item for item in items}
+        scored = await asyncio.gather(
+            *[
+                _judge_one(
+                    eval_item=item_by_id[r.item_id],
+                    run_item=r,
+                    rubric=rubric,
+                    judge_model=judge_model,
+                )
+                for r in runner_result.items
+            ]
+        )
+
+        score_total = 0.0
+        n_scored = 0
+        total_run_cost = runner_result.total_cost_usd
+        total_judge_cost = 0.0
+        for s in scored:
+            db.add(
+                RunResult(
+                    run_id=run.id,
+                    eval_item_id=s.eval_item.id,
+                    actual_output=s.run_item.actual_output,
+                    scores=s.judge.scores,
+                    judge_reasoning=s.judge.reasoning,
+                    mean_score=s.judge.mean_score,
+                    latency_ms=s.run_item.latency_ms,
+                    cost_usd=s.run_item.cost_usd + s.judge.cost_usd,
+                    extras={
+                        "per_objective": s.judge.per_objective,
+                        "cache_hit": s.run_item.cache_hit,
+                        "runner_error": s.run_item.error,
+                    },
+                )
+            )
+            score_total += s.judge.mean_score
+            n_scored += 1
+            total_judge_cost += s.judge.cost_usd
+
+        mean = score_total / n_scored if n_scored > 0 else 0.0
+        run.cost_usd = total_run_cost + total_judge_cost
+        run.mean_score = mean
+        run.status = RunStatus.COMPLETED
+        await db.commit()
+
     await _emit(
-        experiment.id,
+        experiment_id,
         "run.completed",
         run_id=run.id,
         target_model=target_model,
@@ -649,13 +662,14 @@ async def run_experiment(
                 await db.commit()
                 await _emit(experiment_id, "iteration.started", iteration=iteration)
 
-                # 3a. Train pass — parallel fan-out across target models
+                # 3a. Train pass — parallel fan-out across target models.
+                # Each call opens its own AsyncSession (sessions aren't task-safe).
                 train_results = await asyncio.gather(
                     *[
                         _execute_on_split(
-                            db,
-                            experiment,
-                            prompt_version=current_prompt_version,
+                            experiment_id=experiment_id,
+                            prompt_version_id=current_prompt_version.id,
+                            prompt_content=current_prompt_version.content,
                             target_model=target_model,
                             items=train_items,
                             iteration=iteration,
@@ -742,12 +756,13 @@ async def run_experiment(
                     return
 
                 # 3c. Holdout pass on the new version — parallel fan-out
+                # (each call opens its own session, see _execute_on_split).
                 holdout_results = await asyncio.gather(
                     *[
                         _execute_on_split(
-                            db,
-                            experiment,
-                            prompt_version=new_version,
+                            experiment_id=experiment_id,
+                            prompt_version_id=new_version.id,
+                            prompt_content=new_version.content,
                             target_model=target_model,
                             items=holdout_items,
                             iteration=iteration,
