@@ -268,14 +268,32 @@ def _filter_items(
 
 
 def _split(
-    items: list[GeneratedEvalItem], train_ratio: float
+    items: list[GeneratedEvalItem],
+    train_ratio: float,
+    seed: int = 0,
 ) -> tuple[list[GeneratedEvalItem], list[GeneratedEvalItem]]:
-    """Index-based deterministic split. First ceil(N*ratio) → train, rest → holdout."""
-    import math
+    """Shuffled, deterministic train/holdout split.
 
-    n_train = max(1, math.ceil(len(items) * train_ratio))
-    n_train = min(n_train, len(items) - 1) if len(items) > 1 else n_train
-    return items[:n_train], items[n_train:]
+    EvalGen tends to emit items in the order requested by its system prompt
+    ("~60% common, ~25% edge, ~15% adversarial"). Index-based slicing put
+    common items in train and adversarial in holdout, making train
+    systematically easier and invalidating every gap comparison. Shuffling
+    with a deterministic seed removes that bias while keeping the split
+    reproducible per experiment.
+    """
+    import math
+    import random
+
+    n = len(items)
+    n_train = max(1, math.ceil(n * train_ratio))
+    n_train = min(n_train, n - 1) if n > 1 else n_train
+
+    idx = list(range(n))
+    random.Random(seed).shuffle(idx)  # noqa: S311 — non-cryptographic shuffle is intentional
+    train_set = set(idx[:n_train])
+    train = [items[i] for i in range(n) if i in train_set]
+    holdout = [items[i] for i in range(n) if i not in train_set]
+    return train, holdout
 
 
 async def generate(
@@ -288,6 +306,7 @@ async def generate(
     eval_size: int,
     train_ratio: float,
     model: str,
+    split_seed: int = 0,
 ) -> EvalGenResult:
     user_msg = _build_user_message(
         intent=intent,
@@ -349,7 +368,7 @@ async def generate(
         ]
         items = []
 
-    train, holdout = _split(items, train_ratio)
+    train, holdout = _split(items, train_ratio, seed=split_seed)
     return EvalGenResult(
         rubric=rubric,
         train_items=train,

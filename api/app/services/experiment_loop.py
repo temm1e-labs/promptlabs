@@ -15,6 +15,8 @@ Phases:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import math
 import statistics
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -305,10 +307,24 @@ async def _execute_on_split(
 # ─── convergence + best-version tracking ─────────────────────────────────
 
 
-def _train_plateaued(train_means: list[float], delta: float = 0.01) -> bool:
-    """Plateau when the last 3 means differ by less than `delta`."""
+def _scaled_threshold(n_items: int, sigma: float = 0.2, z: float = 1.96) -> float:
+    """Sample-size-aware threshold.
+
+    SE of an iteration mean over N items with per-item std sigma is sigma/sqrt(N).
+    A change of z * SE is the 95% CI half-width — i.e. the minimum change that
+    isn't pure sampling noise.
+
+    Default sigma=0.2 reflects empirically-observed per-item std of LLM-judge
+    scores in [0, 1]. With N=15 → ~0.10, N=30 → ~0.07, N=60 → ~0.05.
+    """
+    return z * sigma / math.sqrt(max(1, n_items))
+
+
+def _train_plateaued(train_means: list[float], n_train: int = 30) -> bool:
+    """Plateau when 3-iteration window range is below the per-iteration noise floor."""
     if len(train_means) < 3:
         return False
+    delta = _scaled_threshold(n_train)
     window = train_means[-3:]
     return (max(window) - min(window)) < delta
 
@@ -316,24 +332,23 @@ def _train_plateaued(train_means: list[float], delta: float = 0.01) -> bool:
 def _overfitting(
     train_means: list[float],
     holdout_means: list[float],
-    min_holdout_drop: float = 0.04,
-    min_gap: float = 0.05,
+    n_train: int = 30,
+    n_holdout: int = 15,
 ) -> bool:
-    """True overfit signal — distinct from ceiling-noise.
+    """Divergence-based overfit detection.
 
-    Requires BOTH:
-      1. Holdout dropped at least `min_holdout_drop` over the last 3 iterations
-         (catches material regression, ignores ±1-2pp jitter from small eval sets).
-      2. Current train minus holdout gap >= `min_gap` (catches the actual overfit pattern:
-         train memorizing while holdout falls — not both lines wobbling together).
+    Overfit ⇔ train rising AND holdout falling, each by more than its own
+    sample-size-aware noise threshold. Co-regression (both down) and co-
+    improvement (both up) explicitly do NOT trigger — those aren't overfit,
+    those are different phenomena.
     """
     if len(train_means) < 3 or len(holdout_means) < 3:
         return False
-    holdout_drop = holdout_means[-3] - holdout_means[-1]
-    if holdout_drop < min_holdout_drop:
-        return False
-    current_gap = train_means[-1] - holdout_means[-1]
-    return current_gap >= min_gap
+    delta_train = train_means[-1] - train_means[-3]
+    delta_holdout = holdout_means[-1] - holdout_means[-3]
+    tau_train = _scaled_threshold(n_train)
+    tau_holdout = _scaled_threshold(n_holdout)
+    return delta_train >= tau_train and delta_holdout <= -tau_holdout
 
 
 # ─── failure sampling for the optimizer ─────────────────────────────────
@@ -345,7 +360,16 @@ async def _failure_samples_for_optimizer(
     iteration: int,
     k: int = 8,
 ) -> list[dict[str, Any]]:
-    """Pick the k lowest-scoring train items from the latest iteration's runs."""
+    """Stratified failure sampling — balanced coverage across failing criteria.
+
+    Pass 1: for each rubric criterion C, take the lowest-scoring train item where
+            C scored < 0.5 (one exemplar per failing criterion).
+    Pass 2: fill remaining slots up to k with lowest-overall failures not yet
+            chosen.
+
+    Previous behavior (top-k by mean) often returned 8 duplicates of the same
+    failure mode, blinding the Optimizer to other broken criteria.
+    """
     stmt = (
         select(RunResult, EvalItem)
         .join(Run, Run.id == RunResult.run_id)
@@ -356,23 +380,49 @@ async def _failure_samples_for_optimizer(
             Run.split == Split.TRAIN,
         )
         .order_by(RunResult.mean_score.asc())
-        .limit(k)
     )
     rows = (await db.execute(stmt)).all()
-    samples: list[dict[str, Any]] = []
+
+    # Pass 1: one exemplar per failing criterion (the lowest-scoring one)
+    per_criterion: dict[str, tuple[Any, Any]] = {}
     for run_result, eval_item in rows:
-        failing_criteria = [k for k, v in (run_result.scores or {}).items() if v < 0.5]
+        for crit_name, score in (run_result.scores or {}).items():
+            if score < 0.5 and crit_name not in per_criterion:
+                per_criterion[crit_name] = (run_result, eval_item)
+
+    chosen_ids: set[str] = {rr.id for rr, _ in per_criterion.values()}
+    samples: list[dict[str, Any]] = []
+    for rr, ei in per_criterion.values():
+        failing = [c for c, v in (rr.scores or {}).items() if v < 0.5]
         samples.append(
             {
-                "label": eval_item.label,
-                "mean_score": run_result.mean_score,
-                "failing_criteria": failing_criteria,
-                "input_vars": eval_item.input_vars,
-                "actual_output": run_result.actual_output,
-                "reasoning": run_result.judge_reasoning,
+                "label": ei.label,
+                "mean_score": rr.mean_score,
+                "failing_criteria": failing,
+                "input_vars": ei.input_vars,
+                "actual_output": rr.actual_output,
+                "reasoning": rr.judge_reasoning,
             }
         )
-    return samples
+
+    # Pass 2: fill remaining slots with lowest-overall failures
+    for rr, ei in rows:
+        if len(samples) >= k:
+            break
+        if rr.id in chosen_ids:
+            continue
+        failing = [c for c, v in (rr.scores or {}).items() if v < 0.5]
+        samples.append(
+            {
+                "label": ei.label,
+                "mean_score": rr.mean_score,
+                "failing_criteria": failing,
+                "input_vars": ei.input_vars,
+                "actual_output": rr.actual_output,
+                "reasoning": rr.judge_reasoning,
+            }
+        )
+    return samples[:k]
 
 
 # ─── the orchestrator ───────────────────────────────────────────────────
@@ -477,6 +527,10 @@ async def run_experiment(
 
             # ── Phase 2: EvalGen ────────────────────────────────────────
             evalgen_model = _agent_model(experiment, "evalgen")
+            # Deterministic split seed: same experiment → same split.
+            split_seed = int(
+                hashlib.sha256(experiment_id.encode()).hexdigest()[:8], 16
+            )
             evalgen_result = await evalgen_agent.generate(
                 intent=experiment.intent,
                 prompt_v0=writer_result.output.prompt,
@@ -486,6 +540,7 @@ async def run_experiment(
                 eval_size=experiment.eval_size,
                 train_ratio=experiment.train_ratio,
                 model=evalgen_model,
+                split_seed=split_seed,
             )
             ok = await _accumulate_cost(db, experiment, evalgen_result.cost_usd)
             rubric_dicts = [c.model_dump() for c in evalgen_result.rubric]
@@ -680,11 +735,16 @@ async def run_experiment(
 
                 current_prompt_version = new_version
 
-                # 3d. Convergence checks
-                if _overfitting(train_means, holdout_means):
+                # 3d. Convergence checks (sample-size aware)
+                if _overfitting(
+                    train_means,
+                    holdout_means,
+                    n_train=len(train_items),
+                    n_holdout=len(holdout_items),
+                ):
                     final_status = ExperimentStatus.OVERFIT
                     break
-                if _train_plateaued(train_means):
+                if _train_plateaued(train_means, n_train=len(train_items)):
                     final_status = ExperimentStatus.CONVERGED
                     break
             else:
