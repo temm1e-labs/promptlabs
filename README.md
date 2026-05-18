@@ -1,28 +1,54 @@
 # PromptLabs
 
-**A closed-loop lab for prompt engineering.** Write a prompt, auto-generate the
-eval set, run it across multiple target models, score with an LLM judge, get a
-*surgical* diff-style rewrite, repeat. Train/holdout discipline so overfitting is
-visible the moment it starts. Multi-provider as a primitive — every agent role
-can run on a different model from a different vendor.
+**A closed-loop lab for production prompt engineering.** You paste an existing prompt or describe an intent. PromptLabs generates a stratified eval set, runs the prompt across every target model you care about in parallel, scores each output with an LLM judge, then proposes a surgical diff. It loops with real train/holdout discipline until the prompt converges, overfits, or runs out of budget.
 
-Built for the moment between *"I have an idea for a prompt"* and *"this prompt
-is production-ready."* That gap is currently filled by hand-tuning, vibes, and
-ad-hoc spreadsheets. PromptLabs replaces it with a measurable loop.
+> Built for the moment between *"I have an idea for a prompt"* and *"this prompt is production-ready."* That gap is filled today by hand-tuning, vibes, and ad-hoc spreadsheets. PromptLabs replaces it with a measurable loop.
+
+---
+
+## The whole loop in one picture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Next.js UI                                                     │
-│    Wizard → Lab notebook (charts, diffs, live SSE)              │
-└───────────────┬─────────────────────────────────────────────────┘
-                │  REST + SSE
-┌───────────────▼─────────────────────────────────────────────────┐
-│  FastAPI                                                        │
-│    routes → orchestrator → 5 agents → LiteLLM → providers       │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                       SQLite / Postgres
+       INPUT
+       ─────
+       intent  ──►  ┌────────────┐
+            OR      │   Writer   │  drafts v0
+       prompt ───►  └──────┬─────┘
+                           ▼
+                    ┌────────────┐    taxonomy (5–8 categories)
+                    │  EvalGen   │  → parallel batch per category
+                    └──────┬─────┘  → dedup → train (70%) | holdout (30%)
+                           │
+            ╔══════════════╪═══════════════════════════════════╗
+            ║              ▼                                   ║
+            ║       ┌────────────┐    fan-out in parallel      ║
+            ║       │   Runner   │    across every target      ║
+            ║       └──────┬─────┘    model you're comparing   ║
+            ║              ▼                                   ║
+            ║       ┌────────────┐    per-criterion scores,    ║
+            ║       │   Judge    │    weighted by rubric,      ║
+            ║       └──────┬─────┘    reasoning attached       ║
+            ║              ▼                                   ║
+            ║       ┌────────────┐    returns a DIFF, not a    ║
+            ║       │ Optimizer  │    regenerated prompt       ║
+            ║       └──────┬─────┘    → apply → v(n+1)         ║
+            ║              ▼                                   ║
+            ║      score v(n+1) on HOLDOUT                     ║
+            ║              ▼                                   ║
+            ║      converged?  overfit?  budget exhausted?     ║
+            ║              │                                   ║
+            ║              ├──── all NO  ──►  back to Runner   ║
+            ║              │                                   ║
+            ║              └──── any YES ──┐                   ║
+            ╚══════════════════════════════│═══════════════════╝
+                                           ▼
+                                  accepted version
+                              served over HTTP to prod
 ```
+
+Five agents. One closed loop. Every box exists for a reason and the science section below explains each one.
+
+---
 
 ## Quickstart
 
@@ -35,189 +61,192 @@ make migrate                  # apply database migrations
 make dev                      # api on :8000, web on :3000
 ```
 
-Open <http://localhost:3000>, create a project, then click **New experiment**.
+Open <http://localhost:3000>, create a project, click **New experiment**.
 
-For deployment as a backend microservice (fetch optimized prompts over HTTP
-from your own apps), see **[docs/deployment.md](docs/deployment.md)**.
+For deployment as a microservice (fetch optimized prompts over HTTP from your own apps), see **[docs/deployment.md](docs/deployment.md)**.
 
 ---
 
-## The problem
+## What problem this solves
 
 You can't iterate on a prompt without three things you almost never have:
 
-1. **A baseline.** Most people start with "let me try a prompt and see what
-   happens." There's no v0 you can point to.
-2. **An eval set that probes failure modes.** Writing 30 diverse test cases by
-   hand is a half-day of work most engineers won't do.
-3. **A way to know whether your rewrite actually helped.** Without a held-out
-   set, every "I think this is better" is vibes.
+```
+   ✗  no baseline           →  "let me try something and see what happens"
+   ✗  no eval set           →  half a day of writing test cases by hand
+   ✗  no holdout            →  every "I think this is better" is vibes
+```
 
-Existing tools assume you have these. Langfuse, LangSmith, Braintrust, Helicone
-are **observability** systems — they help you understand what's happening in
-production prompts you've already deployed. DSPy, PromptWizard, TextGrad are
-**optimization libraries** — they expect you to bring a metric, a training set,
-and a programmer. Promptfoo is a great **evaluation harness** — but you bring
-the prompt and the cases.
+Existing tools assume you already have these:
 
-PromptLabs assumes you have nothing but an intent or a draft prompt, and
-constructs the rest.
+| Tool category | Examples | What they do | What they assume |
+|---|---|---|---|
+| **Observability** | Langfuse, LangSmith, Braintrust, Helicone | Trace prompts in production | You already shipped a prompt |
+| **Optimization library** | DSPy, TextGrad, PromptWizard | Optimize a prompt to a metric | You bring a metric, a training set, and a programmer |
+| **Eval harness** | Promptfoo | Run eval cases against prompts | You bring the prompt and the cases |
 
-## How the loop works
-
-**Phase 1 — Writer.** Given an intent (cold start) or an existing prompt (warm
-start), produce v0. In warm mode, the user's prompt is preserved *verbatim*;
-the Writer only extracts variable declarations and notes observations.
-
-**Phase 2 — EvalGen.** Generate the rubric (3–6 weighted criteria, each
-optionally tagged with an optimization objective) and N test cases. Cases are
-split deterministically 70/30 into *train* and *holdout*. **The Optimizer
-never sees holdout.**
-
-**Phase 3 — iterate** up to `max_iterations`, or until convergence, or until
-budget is exhausted:
-
-1. For each *target* model: run the current prompt against train items,
-   judge each output against the rubric.
-2. Aggregate train scores; if budget exhausted → stop.
-3. Pass the lowest-scoring train items as failure samples to the Optimizer.
-   It returns a **structured diff** — anchored replace/insert/delete edits, not
-   a rewritten prompt. Apply the diff → produce v_n.
-4. Run v_n against *holdout* items, judge, persist.
-5. Convergence check (see math below).
-
-**Phase 4 — accept.** The user picks the iteration to mark as the production
-version. Downstream apps fetch it via `GET /experiments/{id}/best-prompt`.
+PromptLabs assumes you have nothing but an intent or a draft prompt. It constructs the rest.
 
 ---
 
-## The five agents
+## Five agents, one chokepoint
 
-All agents share one **provider chokepoint** (`app/core/providers.py`) that
-wraps LiteLLM: structured-output via Pydantic schemas, content-addressed
-response cache, exponential-backoff retry, bounded concurrency, cost tracking.
+Every LLM call in the system flows through **one provider layer** (`app/core/providers.py`) wrapping LiteLLM — structured output via Pydantic, content-addressed cache, exponential-backoff retry, bounded concurrency, cost tracking. So every cost number, every retry, every cached response is visible in one place.
 
-| Agent | Job | Output schema | Key constraint |
-|---|---|---|---|
-| **Writer** | `(intent \| existing_prompt) → v0` | `{prompt, variables, rationale, assumptions}` | Warm mode preserves user prompt verbatim; if no `{{var}}` present, Runner uses chat-structured execution (system+user) |
-| **EvalGen** | `(intent, v0, objectives) → rubric + eval items` | `{rubric: [{name, definition, weight, objective}], items: [{label, input_text/input_vars, expected_output?, tags}]}` | Items reconciled to declared variables (case-insensitive, positional, or flat `input_text` fallback). Deterministic train/holdout split |
-| **Runner** | `(prompt, items, target_model) → per-item outputs` | n/a — emits `RunResult` per item | Bounded concurrency; auto-detects templated vs. chat-structured mode based on placeholder presence |
-| **Judge** | `(rubric, item, actual_output) → scores` | `{scores: [{name, score: 0..1, reasoning}], overall_reasoning}` | Drops criteria not in the rubric; clamps scores to [0,1]; weighted aggregation |
-| **Optimizer** | `(prompt_v_{n-1}, train failures, objectives) → diff` | `{edits: [{op, anchor?, new_text?, reason, targets_criterion?}], summary}` | Hard cap on edits/iter; rejects diffs that introduce new `{{var}}`; rejects ambiguous anchors |
+```
+                       ┌──────────────────┐
+   Writer   ─────────► │                  │
+   EvalGen  ─────────► │   providers.py   │ ───► LiteLLM ───► 140+ providers
+   Runner   ─────────► │   (chokepoint)   │
+   Judge    ─────────► │                  │ ───► cache (SHA256 keyed)
+   Optimizer ────────► │                  │ ───► cost tracking
+                       └──────────────────┘
+```
 
-Each role is independently configurable per experiment (`agent_config` field).
-You can run Writer on a cheap model and Judge on an expensive one, or anything
-else. Target models — the models being *tested* — are a separate axis.
+| Agent | Job | Key constraint |
+|---|---|---|
+| **Writer** | `(intent \| existing_prompt) → v0` | Warm mode preserves user prompt verbatim. No `{{var}}` placeholders → Runner uses chat-structured execution |
+| **EvalGen** | `(intent, v0, objectives) → rubric + eval items` | Stratified taxonomy + parallel batches + dedup. Deterministic shuffled 70/30 split |
+| **Runner** | `(prompt, items, target_model) → outputs` | Bounded concurrency. Auto-detects templated vs. chat-structured mode |
+| **Judge** | `(rubric, item, actual_output) → scores` | Per-criterion scoring with reasoning, weighted aggregation, clamped to `[0,1]` |
+| **Optimizer** | `(prompt_v_{n-1}, train failures) → diff` | Anchored edits with hard cap. Rejects diffs that introduce new variables |
+
+Each role is independently configurable per experiment. Run Writer on Sonnet 4.6, Judge on Haiku, target models on whatever you actually ship with. Target models (what you're *testing*) and agent models (what *drives the loop*) are separate axes.
+
+---
+
+## How EvalGen generates a real eval set (not 50 happy-path copies)
+
+A single LLM call asked for 50 diverse test cases produces 40 reworded variations of the easiest one. Output quality degrades past ~15 items per call. PromptLabs splits the work:
+
+```
+        ┌────────────────────────────────────────┐
+        │  Step 1 — Taxonomy (one small call)    │
+        │                                        │
+        │   intent  +  prompt v0   →   rubric    │
+        │                          +   5-8       │
+        │                              categories│
+        └────────────────────┬───────────────────┘
+                             │
+                             ▼
+   ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐
+   │  cat 1  │  │  cat 2  │  │  cat 3  │  │  cat 4  │  │  cat 5  │
+   │ ~8 items│  │ ~8 items│  │ ~8 items│  │ ~8 items│  │ ~8 items│
+   └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘
+        │            │            │            │            │
+        └────────────┴───── parallel ──────────┴────────────┘
+                             │
+                             ▼
+                  Step 2 — Dedup (text hash)
+                             │
+                             ▼
+                  Step 3 — Top-up if short
+                             │
+                             ▼
+                shuffled deterministic split
+                             │
+                ┌────────────┴────────────┐
+                ▼                         ▼
+            TRAIN (70%)              HOLDOUT (30%)
+            Optimizer sees these     Optimizer NEVER sees these
+```
+
+The taxonomy gives you structural diversity. Parallel calls keep each batch inside the "reliable structured output" envelope. Dedup catches near-duplicates across batches. The result is an eval set that covers what your prompt will actually see, not what was easiest to imagine.
+
+For `eval_size <= 15` PromptLabs skips the taxonomy and uses a single call. The overhead isn't worth it for small sets.
+
+---
+
+## How the loop runs target models in parallel
+
+Choosing between Sonnet 4.6, GPT-5, and Gemini 3? They all run on the same eval set simultaneously, not sequentially:
+
+```
+                   train items (one set, 35 items)
+                              │
+                              ▼
+            ┌──────────────────────────────────────┐
+            │                                      │
+       ┌────┴────┐                            ┌────┴────┐
+       │ runner  │  runner  │  runner  │   ...│ runner  │
+       │ Sonnet  │  GPT-5   │  Gemini  │      │  ...    │
+       └────┬────┘  └────┬───┘  └────┬───┘   └────┬─────┘
+            │            │           │            │
+            └──────── all in parallel ────────────┘
+                              │
+                              ▼
+                       judges (parallel)
+                              │
+                              ▼
+                   per-model leaderboard
+                  + cost/eval on same chart
+```
+
+For N target models this is an Nx walltime reduction on the runner and judge phases. Results in four minutes, not three afternoons.
 
 ---
 
 ## The science (why each guardrail exists)
 
-### Train / holdout split — what it actually controls for
-
-Goodhart: *when a measure becomes a target, it ceases to be a good measure*.
-If the Optimizer can see every eval item, it'll memorize them — prompts look
-great on the eval and fail in production.
-
-Mitigation: a **shuffled, deterministic** split. Items are shuffled by a
-per-experiment seed before slicing — without this, the LLM's tendency to emit
-common cases first, adversarial last makes train systematically easier than
-holdout. The Optimizer is fed the rubric, the current prompt, and failure
-samples from the train pool only.
+### Train / holdout — shuffled, deterministic, enforced
 
 ```
-Items: 50
-Train: 35  ← Optimizer sees these       (shuffled subset)
-Holdout: 15  ← Optimizer never sees these (shuffled subset)
-seed: SHA256(experiment_id)[:8]         (deterministic, per-experiment)
+   raw items from EvalGen:   [happy, happy, happy, edge, edge, adv, adv, ...]
+                                              │
+                                              ▼  shuffle by SHA256(experiment_id)
+                                              │
+                             [edge, happy, adv, happy, edge, happy, adv, ...]
+                                              │
+                          ┌───────────────────┴───────────────────┐
+                          ▼                                       ▼
+                    train (70%)                            holdout (30%)
+                    seen by Optimizer                      never leaks
 ```
 
-**What this does NOT control for** (be honest with yourself):
-
-- *In-distribution overfitting only.* Both splits come from one EvalGen call.
-  If EvalGen has a blind spot (no multilingual, no injection attempts), the
-  holdout is just as blind. The loop happily converges on prompts that fail
-  on out-of-distribution inputs.
-- *Rubric leakage.* The rubric was generated alongside the items, so its
-  criteria implicitly reflect knowledge of the holdout. The Optimizer sees
-  the rubric.
+The shuffle matters. Without it, EvalGen's natural tendency to emit common cases first and adversarial last puts the easy cases in train and the hard cases in holdout, making train systematically easier and invalidating every train-vs-holdout comparison. The seed is `SHA256(experiment_id)[:8]`, so the split is reproducible per experiment.
 
 ### Overfit detector — divergence-based, sample-size aware
 
-Per-iteration train/holdout means and their 3-iteration changes:
+Overfitting is *divergence*, not *holdout going down*. The detector watches both sides:
 
 ```
-Δtrain[n]   = train_mean[n] − train_mean[n-3]
-Δholdout[n] = holdout_mean[n] − holdout_mean[n-3]
+          train  ─────────────────────────────────────► time
+                 ↗ ↗ ↗ ↗ ↗ ↗
+                                                     ┌─── OVERFIT
+                                                     │     train ↑
+                                                     │     holdout ↓
+                 ↘ ↘ ↘ ↘ ↘                           │     by > τ(N)
+          holdout ─────────────────────────────────► time
 ```
 
-Overfit is **divergence** — train rising AND holdout falling. The detector:
-
 ```
-τ(N) = 1.96 · σ / √N                    (95% CI half-width; σ ≈ 0.2)
-overfit ⇔ Δtrain[n] ≥ τ(N_train)        AND
-          Δholdout[n] ≤ −τ(N_holdout)
+   τ(N) = 1.96 · σ / √N                    (95% CI half-width; σ ≈ 0.2)
+
+   overfit  ⇔   Δtrain[n]   ≥  +τ(N_train)    AND
+                Δholdout[n] ≤  −τ(N_holdout)
 ```
 
-Each side's threshold scales with that side's sample size, so the rule
-behaves consistently from Quick (N=20) through Thorough (N=100). Co-regression
-(both falling) and co-improvement (both rising) explicitly do **not** trigger.
+Each side's threshold scales with that side's sample size. The rule behaves consistently from Quick (N=20) through Thorough (N=100). Co-regression (both falling) and co-improvement (both rising) explicitly do **not** trigger — those are different phenomena.
 
 ### Convergence — sample-size aware plateau
 
-```
-δ(N) = 1.96 · σ / √N
-converged ⇔ max(train_mean[n-2:n+1]) − min(train_mean[n-2:n+1]) < δ(N_train)
-```
-
-i.e. the last three iterations' means are within the per-iteration noise floor.
-No point burning more LLM calls when the signal is below the noise.
-
-### Reporting variance — what the chart actually shows
-
-Every score line in the lab notebook now includes a **95% confidence band**:
+Stop the loop when the last three iterations' means are inside the per-iteration noise floor:
 
 ```
-mean ± 1.96 · σ̂/√N
+   δ(N)        = 1.96 · σ / √N
+   converged   ⇔   max(train[n-2:n+1]) − min(train[n-2:n+1])  <  δ(N_train)
 ```
 
-where σ̂ is the per-item std of `mean_score` across all RunResults in that
-iteration/split. A `(N=15)` badge in the tooltip reminds you what you're
-looking at. A wide band on N=6 means the point estimate is not a measurement.
+No point burning more LLM calls when the signal sits below the noise.
 
 ### Production selection — lower confidence bound, not greedy max
 
-`GET /experiments/{id}/best-prompt` picks the prompt to serve via:
-
 ```
-LCB(v) = mean_holdout(v) − 1.96 · σ̂_holdout(v) / √N_holdout(v)
-v* = argmax_v LCB(v)                    (after any user-accepted iteration)
+   greedy max:    pick argmax(mean)               ← favors lucky high-variance prompts
+   LCB:           pick argmax(mean − 1.96·SE)     ← favors robust prompts
 ```
 
-Greedy max favors high-variance lucky-streak prompts. LCB favors robust ones.
-On small holdout sets (N ≤ 15) the two rules pick different winners often
-enough to matter — LCB is the safer default for production.
-
-### Weighted scoring
-
-For each rubric criterion `c` with weight `w_c`, the judge returns a score
-`s_c ∈ [0, 1]`. The item-level mean is:
-
-```
-mean_score(item) = Σ_c (w_c · s_c) / Σ_c (w_c)
-```
-
-restricted to criteria the judge actually scored (it's allowed to abstain).
-
-Per-objective aggregation uses the same weighted-mean formula but restricted
-to criteria tagged with that objective:
-
-```
-score(objective) = Σ_{c: c.objective = obj} (w_c · s_c) / Σ_{c: c.objective = obj} (w_c)
-```
-
-This is what lets you ask, after the run, "*how well does v4 do on
-robustness versus brevity?*" instead of one global number.
+`GET /experiments/{id}/best-prompt` uses LCB. On small holdout sets (N ≤ 15) the two rules pick different winners often enough to matter, and the robust pick is the right default for production.
 
 ### Diff over rewrite
 
@@ -235,64 +264,65 @@ The Optimizer outputs a list of structured edits, not a new prompt:
 
 Three reasons this matters:
 
-1. **Interpretability.** The user sees *what changed and why* on every
-   iteration. A whole-prompt rewrite hides the reasoning.
-2. **Stability.** The prompt evolves through small steps. Catastrophic
-   regressions are rare; rollback to v_{n-1} is trivial.
-3. **Constraint enforcement.** Code-level guards:
-   - Anchor must be unique (one occurrence) — prevents accidental wide
-     replacement.
-   - Max 5 edits per iteration.
-   - Cumulative chars changed capped at `max(100, 0.35 × prompt_len)`.
-   - Diff is **rejected** if it introduces any new `{{variable}}` — the eval
-     items would have no values for it, breaking every downstream call.
-   - Reverts to v_{n-1} on validation failure rather than persisting a broken
-     prompt.
+1. **Interpretability.** Every iteration shows you *what changed and why*. A whole-prompt rewrite hides reasoning.
+2. **Stability.** The prompt evolves through small steps. Catastrophic regressions are rare; rollback to v_{n-1} is trivial.
+3. **Constraint enforcement.** Code-level guards: anchor must be unique, max 5 edits per iteration, cumulative chars changed capped at `max(100, 0.35 × prompt_len)`, diff rejected if it introduces new `{{variable}}`.
 
 ### Failure-sample selection — stratified, not greedy
 
-The Optimizer receives `k=8` failure samples per iteration. Selection is
-**stratified by failing criterion**:
+The Optimizer receives `k=8` failure samples per iteration:
 
 ```
-pass 1: for each rubric criterion c:
-            pick the lowest-scoring train item where score(c) < 0.5
-            (one exemplar per criterion that's actually failing)
-pass 2: fill remaining slots up to k with next-lowest overall failures
+   Pass 1:   for each rubric criterion C:
+                pick the lowest-scoring train item where score(C) < 0.5
+                → one exemplar per failing criterion
+
+   Pass 2:   fill remaining slots up to k with next-lowest overall
 ```
 
-Previous behavior (top-k by mean score) collapsed when many items failed the
-same criterion — the Optimizer saw 8 duplicates of "format wrong" and missed
-the items failing "robustness". Stratified sampling gives balanced edit signal.
+Previous behavior (top-k by mean) collapsed when many items failed the same criterion — the Optimizer saw 8 duplicates of "format wrong" and missed items failing "robustness". Stratified selection gives balanced edit signal.
+
+### Weighted scoring
+
+For each rubric criterion `c` with weight `w_c` and judge score `s_c ∈ [0,1]`:
+
+```
+   mean_score(item)   =   Σ_c (w_c · s_c)  /  Σ_c (w_c)
+                        (restricted to criteria the judge actually scored)
+```
+
+Per-objective aggregation uses the same formula restricted to criteria tagged with that objective. That's what lets you ask "how well does v4 do on robustness vs. brevity?" instead of one global number.
 
 ### Budget as a hard constraint
 
-Every LLM call adds its cost (from `litellm.completion_cost`) to
-`experiment.cost_usd`. Before each phase boundary the orchestrator checks
-`cost_usd < budget_usd`; if not, status flips to `EXHAUSTED` and the loop
-stops cleanly. No silent overruns.
+Every LLM call adds its cost (from `litellm.completion_cost`) to `experiment.cost_usd`. Before each phase boundary the orchestrator checks `cost_usd < budget_usd`; if not, status flips to `EXHAUSTED` and the loop stops cleanly. No silent overruns.
 
 ---
 
 ## The two execution modes
 
-The Runner inspects the prompt for `{{variable}}` placeholders (regex:
-`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}`) and chooses:
+The Runner inspects the prompt for `{{variable}}` placeholders and picks one of two modes:
 
-**Templated mode** (placeholders present) — the canonical case. Substitute the
-eval item's `input_vars` and send as a single user message. Use for:
-classification, extraction, summarization, anything where the prompt is a
-function of one or more inputs.
+```
+                  has {{placeholders}}?
+                          │
+                ┌─────────┴─────────┐
+              YES                  NO
+                │                   │
+                ▼                   ▼
+    ┌─────────────────┐   ┌─────────────────────┐
+    │ Templated mode  │   │ Chat-structured     │
+    │                 │   │                     │
+    │ substitute vars │   │ prompt → system msg │
+    │ → single user   │   │ user_input → user   │
+    │   message       │   │   message           │
+    └─────────────────┘   └─────────────────────┘
+       classification           agent system prompts
+       extraction               callbot instructions
+       summarization            "the prompt is the role"
+```
 
-**Chat-structured mode** (no placeholders) — the prompt becomes a **system**
-message, and the eval item's `user_input` (or first available variable)
-becomes the **user** message. Use for: agent system prompts, callbot
-instructions, anything where the whole prompt *is* the role definition and
-variation comes from the user's turn.
-
-The Writer/EvalGen pipeline auto-detects this and synthesizes a virtual
-`user_input` variable for the chat case, without touching the original prompt
-text.
+The Writer/EvalGen pipeline auto-detects the placeholder-less case and synthesizes a virtual `user_input` variable for evals, without modifying the original prompt text. So warm-starting from a real production system prompt works without rewriting anything.
 
 ---
 
@@ -300,72 +330,52 @@ text.
 
 - Not a production observability tool. Use Langfuse for that.
 - Not a multi-tenant SaaS. Single-user, local-first by design.
-- Not a replacement for human eval. The LLM judge can be wrong; the rubric
-  matters. Always read the failure samples in the lab notebook.
-- Not magic. If the LLM driving the agents is unreliable (e.g. some preview
-  models flake at structured output), the loop degrades.
+- Not a replacement for human eval. The LLM judge can be wrong; always read the failure samples.
+- Not magic. If the agent LLM is unreliable at structured output (some preview models flake), the loop degrades.
 
-## Honest limitations of the methodology
+## Honest limitations
 
-The closed loop is well-instrumented but the **measurements have boundaries**.
-These are the ones a real user should understand before trusting a score:
+The closed loop is well-instrumented, but the measurements have boundaries:
 
-1. **Internal validity only, not external validity.** A 95% holdout score
-   means *"this prompt does well on an LLM-generated eval set, graded by
-   another LLM."* It does NOT mean 95% accuracy on your production traffic.
-   Always re-measure with real data once a prompt is deployed.
+1. **Internal validity only.** A 95% holdout score means "this prompt does well on an LLM-generated eval set, graded by another LLM." It does NOT mean 95% on your production traffic. Always re-measure with real data after deploying.
 
-2. **In-distribution overfit detection only.** Train and holdout both come
-   from a single EvalGen call. If EvalGen has blind spots (no multilingual
-   inputs, no prompt-injection probes, no adversarial code-switching), both
-   splits miss the same failure modes.
+2. **In-distribution overfit detection only.** Train and holdout both come from a single EvalGen call. Blind spots in EvalGen (no multilingual, no injection probes) affect both splits equally.
 
-3. **Greedy multi-target optimization.** With multiple target models the
-   Optimizer's failure samples are aggregated; the prompt drifts toward
-   whichever model's failures dominate. This is "compare on the same prompt",
-   not "fairly A/B-test optimized prompts." Per-target Optimizer is on the
-   roadmap.
+3. **Greedy multi-target optimization.** With multiple target models the Optimizer's failure samples are aggregated; the prompt drifts toward whichever model's failures dominate. Per-target Optimizer is on the roadmap.
 
-4. **Power limits at small N.** Quick preset (N=20, holdout=6) can detect a
-   ~12pp improvement reliably. Anything smaller is below the noise floor.
-   Use Standard (N=50) or Thorough (N=100) when the change you care about is
-   ≤5pp.
+4. **Power limits at small N.** Quick preset (N=20, holdout=6) can detect a ~12pp improvement reliably. Smaller improvements are below the noise floor. Use Standard (N=50) or Thorough (N=100) for fine-grained changes.
 
-5. **Reproducibility is partial.** The train/holdout split is deterministic
-   per experiment (seeded by `SHA256(experiment_id)`). The eval items
-   themselves are LLM-generated and **not** byte-reproducible across runs.
-   Re-running an experiment with the same intent gets a similar — but not
-   identical — eval set.
+5. **Partial reproducibility.** The train/holdout split is deterministic per experiment. The eval items themselves are LLM-generated and not byte-reproducible — re-running gets a similar but not identical eval set.
 
-6. **The judge has no ground truth.** LLM-graded scores in `[0, 1]` are
-   subjective fuzzy values, not probabilities. The aggregate "best score"
-   is opinionated by an LLM with no domain expertise. Read failure samples.
+6. **The judge has no ground truth.** LLM-graded scores are subjective fuzzy values, not probabilities. Always read failure samples.
 
-7. **Rubric leakage.** EvalGen produces the rubric and the items in the same
-   call, so the rubric's criteria implicitly reflect knowledge of the
-   holdout. The Optimizer sees the rubric. This is a real (if subtle)
-   information leak that we haven't yet plugged.
+7. **Rubric leakage.** EvalGen produces the rubric and items in the same call, so the rubric's criteria implicitly reflect knowledge of the holdout. The Optimizer sees the rubric. Real (if subtle) information leak that we haven't yet plugged.
 
-When all this is acknowledged, the system is what it is: **an instrumented
-fast loop for prompt iteration with honest error bars, sample-size-aware
-guardrails, and a defensible production selection rule.** That's a useful
-thing. It is not "automatic prompt optimization with statistical guarantees."
+When all this is acknowledged, the system is what it is: **an instrumented fast loop for prompt iteration with honest error bars, sample-size-aware guardrails, and a defensible production selection rule.** Useful. Not "automatic prompt optimization with statistical guarantees."
 
 ---
 
 ## Stack
 
-**Backend** — Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.x async,
-aiosqlite, Alembic, LiteLLM, tenacity, sse-starlette, structlog. Managed by
-`uv`. 83 unit tests + 1 live end-to-end test against the Gemini API.
+```
+       ┌─────────────────────────────────────────────────────────┐
+       │   Frontend                                              │
+       │   Next.js 15 · React 19 · TS strict · Tailwind v4       │
+       │   shadcn/ui · Recharts · TanStack Query · Sonner        │
+       └─────────────────────────────┬───────────────────────────┘
+                                     │  REST + SSE
+       ┌─────────────────────────────▼───────────────────────────┐
+       │   Backend                                               │
+       │   Python 3.12 · FastAPI · Pydantic v2 · async SQLA 2.x  │
+       │   LiteLLM · aiosqlite · Alembic · sse-starlette         │
+       │   tenacity · structlog · uv                             │
+       └─────────────────────────────┬───────────────────────────┘
+                                     │
+                                     ▼
+                             SQLite / Postgres
+```
 
-**Frontend** — Next.js 15 (App Router), React 19, TypeScript strict,
-Tailwind v4, shadcn/ui primitives, Recharts, TanStack Query, Sonner. Managed
-by `pnpm`. Dark-first theme.
-
-**Deployment** — Docker images for both `api/` and `web/`. The API is a
-self-contained microservice that downstream apps query via REST. See
-`docs/deployment.md`.
+97 unit tests + 1 live end-to-end test against the Gemini API. Docker images for both `api/` and `web/`. The API is a self-contained microservice that downstream apps query via REST.
 
 ---
 
@@ -373,6 +383,7 @@ self-contained microservice that downstream apps query via REST. See
 
 ```python
 import httpx
+
 r = httpx.get(
     f"{PROMPTLABS_URL}/experiments/{experiment_id}/best-prompt",
     headers={"Authorization": f"Bearer {PROMPTLABS_API_KEY}"},
@@ -380,10 +391,7 @@ r = httpx.get(
 prompt: str = r.json()["prompt"]
 ```
 
-The endpoint returns the user-accepted iteration if any; otherwise the
-iteration with the highest mean holdout score; otherwise the most recent
-iteration. See `docs/deployment.md` for production patterns (caching,
-fallback prompts, alias proposals).
+The endpoint returns the user-accepted iteration if one exists; otherwise the highest-LCB iteration; otherwise the most recent. See `docs/deployment.md` for production patterns: caching, fallback prompts, alias proposals, CORS allowlists, rate limiting.
 
 ---
 
