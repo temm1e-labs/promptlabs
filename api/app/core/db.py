@@ -34,7 +34,11 @@ if _is_sqlite:
     def _sqlite_pragmas(dbapi_connection, _connection_record):  # type: ignore[no-untyped-def]
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA busy_timeout=5000")
+        # 15s is long enough to absorb a typical LLM call's worth of write-lock
+        # contention. Combined with _accumulate_cost committing immediately
+        # instead of flushing, the cancel endpoint should never time out in
+        # practice — but the longer timeout is a safety net.
+        cursor.execute("PRAGMA busy_timeout=15000")
         cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
 

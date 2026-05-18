@@ -180,93 +180,99 @@ export function ScoreTrajectory({
             />
           )}
 
-          {/* SINGLE-MODEL PATH — preserves the existing aesthetic exactly. */}
+          {/*
+            CRITICAL: Recharts 2.x uses React.Children.forEach to scan for Line/
+            Area/Bar children. That iteration does NOT recurse into Fragments.
+            Wrapping these in <>...</> made them invisible to Recharts and the
+            chart silently rendered axes only. Every Area/Line below must be a
+            direct child of ComposedChart — no fragments, no helper components.
+          */}
           {!multi && (
-            <>
-              <Area
-                type="monotone"
-                dataKey="train_band"
-                stroke="none"
-                fill="var(--primary)"
-                fillOpacity={0.12}
-                connectNulls
-                isAnimationActive={false}
-                name="train_band"
-              />
-              <Area
-                type="monotone"
-                dataKey="holdout_band"
-                stroke="none"
-                fill="var(--primary)"
-                fillOpacity={0.08}
-                connectNulls
-                isAnimationActive={false}
-                name="holdout_band"
-              />
+            <Area
+              type="monotone"
+              dataKey="train_band"
+              stroke="none"
+              fill="var(--primary)"
+              fillOpacity={0.12}
+              connectNulls
+              isAnimationActive={false}
+              name="train_band"
+            />
+          )}
+          {!multi && (
+            <Area
+              type="monotone"
+              dataKey="holdout_band"
+              stroke="none"
+              fill="var(--primary)"
+              fillOpacity={0.08}
+              connectNulls
+              isAnimationActive={false}
+              name="holdout_band"
+            />
+          )}
+          {!multi && (
+            <Line
+              type="monotone"
+              dataKey="train"
+              stroke="var(--primary)"
+              strokeWidth={1.5}
+              dot={{ r: 3 }}
+              activeDot={{ r: 5 }}
+              name="train"
+              connectNulls
+              isAnimationActive={false}
+            />
+          )}
+          {!multi && (
+            <Line
+              type="monotone"
+              dataKey="holdout"
+              stroke="var(--primary)"
+              strokeWidth={1.5}
+              strokeDasharray="4 4"
+              dot={{ r: 3 }}
+              activeDot={{ r: 5 }}
+              name="holdout"
+              connectNulls
+              isAnimationActive={false}
+            />
+          )}
+
+          {/* MULTI-MODEL PATH — one solid (train) + one dashed (holdout) per
+              model. Arrays are fine as direct children (React.Children.forEach
+              iterates arrays). Each Line must have a unique key. */}
+          {multi &&
+            models.map((m, idx) => (
               <Line
+                key={`train::${m}`}
                 type="monotone"
-                dataKey="train"
-                stroke="var(--primary)"
+                dataKey={`train::${m}`}
+                stroke={colorFor(idx)}
                 strokeWidth={1.5}
                 dot={{ r: 3 }}
                 activeDot={{ r: 5 }}
-                name="train"
+                name={`train::${m}`}
                 connectNulls
                 isAnimationActive={false}
               />
+            ))}
+          {multi &&
+            models.map((m, idx) => (
               <Line
+                key={`holdout::${m}`}
                 type="monotone"
-                dataKey="holdout"
-                stroke="var(--primary)"
+                dataKey={`holdout::${m}`}
+                stroke={colorFor(idx)}
                 strokeWidth={1.5}
                 strokeDasharray="4 4"
                 dot={{ r: 3 }}
                 activeDot={{ r: 5 }}
-                name="holdout"
+                name={`holdout::${m}`}
                 connectNulls
                 isAnimationActive={false}
               />
-            </>
-          )}
-
-          {/* MULTI-MODEL PATH — one solid (train) + one dashed (holdout) per model. */}
-          {multi &&
-            models.map((m, idx) => {
-              const color = colorFor(idx);
-              return (
-                <Line
-                  key={`train::${m}`}
-                  type="monotone"
-                  dataKey={`train::${m}`}
-                  stroke={color}
-                  strokeWidth={1.5}
-                  dot={{ r: 3 }}
-                  activeDot={{ r: 5 }}
-                  name={`train::${m}`}
-                  connectNulls
-                  isAnimationActive={false}
-                />
-              );
-            })}
-          {multi &&
-            models.map((m, idx) => {
-              const color = colorFor(idx);
-              return (
-                <Line
-                  key={`holdout::${m}`}
-                  type="monotone"
-                  dataKey={`holdout::${m}`}
-                  stroke={color}
-                  strokeWidth={1.5}
-                  strokeDasharray="4 4"
-                  dot={{ r: 3 }}
-                  activeDot={{ r: 5 }}
-                  name={`holdout::${m}`}
-                  connectNulls
-                  isAnimationActive={false}
-                />
-              );
-            })}
+            ))}
         </ComposedChart>
       </ResponsiveContainer>
     </div>

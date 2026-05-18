@@ -55,9 +55,17 @@ def _agent_model(experiment: Experiment, role: str) -> str:
 
 
 async def _accumulate_cost(db: AsyncSession, experiment: Experiment, delta: float) -> bool:
-    """Add delta to experiment.cost_usd, persist, return True if STILL within budget."""
+    """Add delta to experiment.cost_usd, persist, return True if STILL within budget.
+
+    Uses commit (not flush) so the write lock on the experiments row is released
+    immediately. Holding a flushed-but-uncommitted write across subsequent LLM
+    calls (judge, optimizer) caused the cancel endpoint to time out on
+    SQLite's busy_timeout — the experiments row stayed locked for tens of
+    seconds while the orchestrator made network calls. WAL alone wasn't enough
+    because writer-vs-writer contention still serializes under WAL.
+    """
     experiment.cost_usd = float(experiment.cost_usd) + float(delta)
-    await db.flush()
+    await db.commit()
     return experiment.cost_usd < float(experiment.budget_usd)
 
 
