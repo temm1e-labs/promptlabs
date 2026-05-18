@@ -81,15 +81,15 @@ async def test_generate_basic_split_and_rubric() -> None:
 @pytest.mark.asyncio
 async def test_generate_reconciles_items_leniently() -> None:
     """Lenient reconciliation: items with recoverable shape are kept and
-    normalized. Only items with nothing usable (no input_vars AND no
-    input_text) get dropped. This is intentional — strict filtering used
-    to drop every item when EvalGen omitted context vars on a multi-var
-    prompt, causing the loop to fail with 'no usable items'."""
+    normalized. Even an item with no input_vars and no input_text gets
+    salvaged from its label (degraded but better than dropping the run).
+    Only TRULY empty items (no label, no input, no expected_output) drop.
+    """
     items = [
         # Exact match — kept as-is
         {"label": "good", "input_vars": {"email": "x"}, "expected_output": None, "tags": []},
-        # Both empty — dropped
-        {"label": "empty", "input_vars": {}, "expected_output": None, "tags": []},
+        # No input_vars and no input_text — salvaged from label
+        {"label": "from_label", "input_vars": {}, "expected_output": None, "tags": []},
         # Extra keys — trimmed to declared, kept (distinct value so dedup doesn't drop it)
         {
             "label": "trimmed",
@@ -119,9 +119,10 @@ async def test_generate_reconciles_items_leniently() -> None:
 
     all_kept = result.train_items + result.holdout_items
     labels = {item.label for item in all_kept}
-    # "empty" dropped; others recovered. "trimmed" loses the bogus "ghost" key.
-    assert "empty" not in labels
-    assert labels == {"good", "trimmed", "good2"}
+    assert labels == {"good", "from_label", "trimmed", "good2"}
+    # The "from_label" item has its label salvaged into the email var
+    salvaged = next(i for i in all_kept if i.label == "from_label")
+    assert salvaged.input_vars["email"] == "from_label"
     # The "trimmed" item should have just the declared var
     trimmed = next(i for i in all_kept if i.label == "trimmed")
     assert set(trimmed.input_vars.keys()) == {"email"}
@@ -258,6 +259,70 @@ async def test_generate_salvages_items_with_unrelated_keys() -> None:
     assert item.input_vars["customer_query"] == "Where do you stock dog leashes?"
     # The context var got the declared example value
     assert item.input_vars["context"] == "Pet Mart, est 2010"
+
+
+@pytest.mark.asyncio
+async def test_generate_salvages_label_only_items() -> None:
+    """Worst-case salvage: the model emitted items where input_vars is empty
+    AND input_text is null, putting the entire test concept in the label
+    ('Dog Food Price Check'). Without salvaging from the label, every item
+    would drop and the loop would fail with 0 usable items — the exact
+    failure mode observed three times in a row with weak preview models.
+    """
+    items = [
+        {
+            "label": "Dog Food Price Check",
+            "input_vars": {},
+            "input_text": None,
+            "expected_output": None,
+            "tags": [],
+        },
+        {
+            "label": "Cat Litter Recommendation",
+            "input_vars": {},
+            "input_text": None,
+            "expected_output": None,
+            "tags": [],
+        },
+    ]
+    with (
+        patch(
+            "app.core.providers.litellm.acompletion",
+            AsyncMock(return_value=_fake_response(_payload(items))),
+        ),
+        patch("app.core.providers.litellm.completion_cost", return_value=0.0),
+    ):
+        result = await generate(
+            intent="pet store support",
+            prompt_v0="ctx: {{store_context}}, q: {{customer_query}}",
+            variables=[
+                PromptVariable(
+                    name="store_context",
+                    description="store info",
+                    example_value="Pet Mart, est 2010",
+                ),
+                PromptVariable(
+                    name="customer_query",
+                    description="user q",
+                    example_value="Do you sell parrot food?",
+                ),
+            ],
+            objectives=["accuracy"],
+            known_issues=None,
+            eval_size=2,
+            train_ratio=0.5,
+            model="openai/gpt-5",
+        )
+
+    kept = result.train_items + result.holdout_items
+    assert len(kept) == 2
+    # Each item should now have all declared vars populated, with the label
+    # text serving as the user-input value
+    by_label = {it.label: it for it in kept}
+    assert by_label["Dog Food Price Check"].input_vars["customer_query"] == "Dog Food Price Check"
+    assert by_label["Cat Litter Recommendation"].input_vars["customer_query"] == "Cat Litter Recommendation"
+    # Context var gets the declared example
+    assert by_label["Dog Food Price Check"].input_vars["store_context"] == "Pet Mart, est 2010"
 
 
 @pytest.mark.asyncio

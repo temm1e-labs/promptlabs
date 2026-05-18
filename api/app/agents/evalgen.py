@@ -193,6 +193,13 @@ Hard rules:
    (b) `input_vars` (ONLY for prompts with 2+ variables) — full {key: value} dict with
        every declared variable.
    NEVER leave both empty. NEVER put the test data only in `label` or `expected_output`.
+   `label` is a 3-8 word summary (e.g. "Dog Food Price Check"), NOT the actual input.
+
+   WRONG (do NOT do this):
+       {"label": "Dog Food Price Check", "input_vars": {}, "input_text": null}
+   RIGHT:
+       {"label": "Dog Food Price Check",
+        "input_text": "How much is the 20lb bag of Acme dog food?"}
 2. Test cases must be DIVERSE: include common cases, edge cases (empty/long/multilingual/
    formatting traps), and adversarial cases (inputs that probe failure modes).
 3. The rubric must have 3-6 criteria, each with a clear `definition` (one sentence) and a
@@ -232,7 +239,16 @@ to produce diverse, realistic items WITHIN this single category.
 
 Hard rules:
 1. Every item's TEST INPUT must be populated via `input_text` (single-variable prompts)
-   or `input_vars` (multi-variable prompts). NEVER leave both empty.
+   or `input_vars` (multi-variable prompts). NEVER leave both empty. NEVER put the test
+   data only in `label` or `expected_output` — `label` is a short summary, NOT the input.
+
+   WRONG (do NOT do this):
+       {"label": "Dog Food Price Check", "input_vars": {}, "input_text": null}
+   RIGHT:
+       {"label": "Dog Food Price Check",
+        "input_vars": {"store_context": "Pet Mart, est 2010",
+                       "customer_query": "How much is the 20lb bag of Acme dog food?"}}
+
 2. All items in your output must clearly belong to the assigned category — do NOT bleed
    into adjacent categories.
 3. Items must be DIVERSE within the category. Don't produce N rewordings of the same idea.
@@ -599,6 +615,19 @@ def _reconcile_item(
             for i, v in enumerate(variables):
                 result[v.name] = longest if i == idx else _example_default(v)
             return result
+
+    # (7) LABEL/EXPECTED-OUTPUT SALVAGE: some weak models put the entire test
+    # concept in `label` (e.g. "Dog Food Price Check") with empty input_vars
+    # AND empty input_text. The label IS the user-meaningful content. Use it
+    # as the input — degraded but lets the experiment proceed instead of
+    # failing with 0 usable items.
+    fallback_text = (item.label or "").strip() or (item.expected_output or "").strip()
+    if fallback_text:
+        idx = _pick_input_var(variables)
+        result = {}
+        for i, v in enumerate(variables):
+            result[v.name] = fallback_text if i == idx else _example_default(v)
+        return result
 
     return None
 
