@@ -1,0 +1,265 @@
+"use client";
+
+import Link from "next/link";
+import { useParams } from "next/navigation";
+import { useMemo } from "react";
+
+import { ScoreTrajectory, type TrajectoryPoint } from "@/components/charts/score-trajectory";
+import { TrainHoldoutGap, type GapPoint } from "@/components/charts/train-holdout-gap";
+import { PromptDiff } from "@/components/lab/prompt-diff";
+import { SSERail } from "@/components/lab/sse-rail";
+import { Badge } from "@/components/ui/badge";
+import { Card } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
+import { useExperiment, usePromptVersions, useRuns } from "@/lib/api/hooks";
+import { formatCost, formatScore, scoreBand } from "@/lib/utils";
+import type { ExperimentStatus, PromptVersion, Run } from "@/lib/api/types";
+
+const STATUS_VARIANT: Record<ExperimentStatus, "default" | "good" | "mid" | "bad" | "outline"> = {
+  pending: "outline",
+  running: "default",
+  paused: "outline",
+  converged: "good",
+  accepted: "good",
+  overfit: "mid",
+  exhausted: "mid",
+  failed: "bad",
+};
+
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+export default function ExperimentPage() {
+  const { id: projectId, expId } = useParams<{ id: string; expId: string }>();
+  const { data: exp } = useExperiment(expId);
+  const { data: versions } = usePromptVersions(expId);
+  const { data: runs } = useRuns(expId);
+
+  const trajectory = useMemo(() => buildTrajectory(runs), [runs]);
+  const gap = useMemo(() => buildGap(trajectory), [trajectory]);
+  const bestHoldout = useMemo(() => {
+    if (!runs) return null;
+    const scores = runs.filter((r) => r.split === "holdout" && r.mean_score != null).map((r) => r.mean_score as number);
+    return scores.length ? Math.max(...scores) : null;
+  }, [runs]);
+
+  return (
+    <div className="flex h-[calc(100vh-3rem)] gap-0 -m-6 lg:-mr-8">
+      <div className="flex-1 overflow-y-auto px-8 py-6">
+        <nav className="mb-6 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+          <Link href="/" className="hover:text-foreground">
+            projects
+          </Link>
+          <span className="mx-2">/</span>
+          <Link href={`/projects/${projectId}`} className="hover:text-foreground">
+            {exp ? "back" : "…"}
+          </Link>
+          <span className="mx-2">/</span>
+          <span className="text-foreground">{exp?.name ?? "…"}</span>
+        </nav>
+
+        <header className="mb-8 flex items-start justify-between border-b border-border pb-6">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight">
+              {exp?.name ?? "Experiment"}
+            </h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {exp?.intent ?? "Loading…"}
+            </p>
+            {exp?.failure_reason && (
+              <p className="mt-2 text-xs text-[var(--score-bad)]">
+                failure: {exp.failure_reason}
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-4">
+            <Stat label="best score" value={bestHoldout != null ? formatScore(bestHoldout) : "—"} band={bestHoldout != null ? (scoreBand(bestHoldout) as "good" | "mid" | "bad") : undefined} />
+            <Separator orientation="vertical" className="h-10" />
+            <Stat label="iteration" value={exp ? `${exp.current_iteration} / ${exp.max_iterations}` : "—"} />
+            <Separator orientation="vertical" className="h-10" />
+            <Stat label="cost" value={exp ? `${formatCost(exp.cost_usd)} / ${formatCost(exp.budget_usd)}` : "—"} />
+            <Separator orientation="vertical" className="h-10" />
+            {exp && <Badge variant={STATUS_VARIANT[exp.status]}>{exp.status}</Badge>}
+          </div>
+        </header>
+
+        <section className="mb-8 grid gap-4 md:grid-cols-2">
+          <Card className="p-5">
+            <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+              score trajectory
+            </h3>
+            <p className="mb-2 text-xs text-muted-foreground">
+              Train (solid) vs holdout (dashed) per iteration. Higher is better.
+            </p>
+            <ScoreTrajectory data={trajectory} />
+          </Card>
+          <Card className="p-5">
+            <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+              train − holdout gap
+            </h3>
+            <p className="mb-2 text-xs text-muted-foreground">
+              Widening gap signals overfitting. Red threshold at 10pp.
+            </p>
+            <TrainHoldoutGap data={gap} />
+          </Card>
+        </section>
+
+        <section className="space-y-4">
+          <h2 className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            iterations
+          </h2>
+          {versions && versions.length === 0 ? (
+            <Card className="px-5 py-12 text-center">
+              <p className="text-sm text-muted-foreground">
+                Waiting for the writer agent to draft v0…
+              </p>
+            </Card>
+          ) : (
+            versions
+              ?.slice()
+              .reverse()
+              .map((v) => (
+                <IterationCard
+                  key={v.id}
+                  version={v}
+                  runs={(runs ?? []).filter((r) => r.prompt_version_id === v.id)}
+                />
+              ))
+          )}
+        </section>
+      </div>
+
+      <SSERail experimentId={expId} apiUrl={API_URL} />
+    </div>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  band,
+}: {
+  label: string;
+  value: string;
+  band?: "good" | "mid" | "bad";
+}) {
+  return (
+    <div>
+      <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+        {label}
+      </div>
+      <div
+        className={
+          band === "good"
+            ? "text-base font-medium text-[var(--score-good)]"
+            : band === "mid"
+            ? "text-base font-medium text-[var(--score-mid)]"
+            : band === "bad"
+            ? "text-base font-medium text-[var(--score-bad)]"
+            : "text-base font-medium"
+        }
+      >
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function IterationCard({ version, runs }: { version: PromptVersion; runs: Run[] }) {
+  const trainRuns = runs.filter((r) => r.split === "train");
+  const holdoutRuns = runs.filter((r) => r.split === "holdout");
+
+  return (
+    <Card className="p-5">
+      <div className="mb-3 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <span className="rounded-md bg-primary/10 px-2 py-0.5 font-mono text-[11px] tracking-tight text-primary">
+            v{version.iteration}
+          </span>
+          <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+            {version.source}
+          </span>
+        </div>
+        <div className="flex items-center gap-4 text-xs">
+          {trainRuns.length > 0 && (
+            <span className="text-muted-foreground">
+              train: <span className="text-foreground">{avgScore(trainRuns)}</span>
+            </span>
+          )}
+          {holdoutRuns.length > 0 && (
+            <span className="text-muted-foreground">
+              holdout: <span className="text-foreground">{avgScore(holdoutRuns)}</span>
+            </span>
+          )}
+        </div>
+      </div>
+      {version.rationale && (
+        <p className="mb-3 text-xs text-muted-foreground">{version.rationale}</p>
+      )}
+      {version.diff?.edits ? (
+        <PromptDiff
+          current={version.content}
+          edits={version.diff.edits}
+          applied={version.diff.applied}
+          skipped={version.diff.skipped}
+        />
+      ) : (
+        <pre className="overflow-x-auto rounded-md border border-border bg-muted/30 p-3 font-mono text-[11px] leading-relaxed">
+          {version.content}
+        </pre>
+      )}
+      {runs.length > 0 && (
+        <div className="mt-4 grid gap-2 md:grid-cols-2">
+          {runs.map((r) => (
+            <div
+              key={r.id}
+              className="flex items-center justify-between rounded-md border border-border bg-card/30 px-3 py-2 text-xs"
+            >
+              <div>
+                <span className="font-mono text-muted-foreground">{r.split}</span>{" "}
+                <span className="font-mono">{r.target_model.split("/")[1] ?? r.target_model}</span>
+              </div>
+              <div className="font-mono">
+                {r.mean_score != null ? formatScore(r.mean_score) : "—"}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function avgScore(runs: Run[]): string {
+  const scores = runs.filter((r) => r.mean_score != null).map((r) => r.mean_score as number);
+  if (scores.length === 0) return "—";
+  return formatScore(scores.reduce((a, b) => a + b, 0) / scores.length);
+}
+
+function buildTrajectory(runs: Run[] | undefined): TrajectoryPoint[] {
+  if (!runs) return [];
+  const byIter = new Map<number, { train: number[]; holdout: number[] }>();
+  for (const r of runs) {
+    if (r.mean_score == null) continue;
+    if (!byIter.has(r.iteration)) byIter.set(r.iteration, { train: [], holdout: [] });
+    byIter.get(r.iteration)![r.split].push(r.mean_score);
+  }
+  return Array.from(byIter.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([iter, v]) => ({
+      iteration: iter,
+      train: v.train.length ? avg(v.train) : null,
+      holdout: v.holdout.length ? avg(v.holdout) : null,
+    }));
+}
+
+function buildGap(trajectory: TrajectoryPoint[]): GapPoint[] {
+  return trajectory
+    .filter((p): p is Required<TrajectoryPoint> & { train: number; holdout: number } =>
+      p.train != null && p.holdout != null,
+    )
+    .map((p) => ({ iteration: p.iteration, gap: p.train - p.holdout }));
+}
+
+function avg(arr: number[]): number {
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}

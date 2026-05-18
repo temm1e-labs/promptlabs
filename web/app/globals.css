@@ -1,0 +1,121 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    /* Aesthetic-science palette — light mode */
+    --background: oklch(0.99 0.005 250);
+    --foreground: oklch(0.15 0.02 250);
+    --muted: oklch(0.96 0.01 250);
+    --muted-foreground: oklch(0.48 0.02 250);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.15 0.02 250);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.15 0.02 250);
+    --border: oklch(0.91 0.008 250);
+    --input: oklch(0.91 0.008 250);
+    --primary: oklch(0.6 0.16 220); /* deep cyan accent */
+    --primary-foreground: oklch(0.99 0 0);
+    --secondary: oklch(0.96 0.01 250);
+    --secondary-foreground: oklch(0.15 0.02 250);
+    --accent: oklch(0.96 0.01 250);
+    --accent-foreground: oklch(0.15 0.02 250);
+    --destructive: oklch(0.6 0.22 27);
+    --destructive-foreground: oklch(0.99 0 0);
+    --ring: oklch(0.6 0.16 220);
+
+    /* Semantic score bands */
+    --score-good: oklch(0.7 0.16 145);
+    --score-mid: oklch(0.78 0.16 80);
+    --score-bad: oklch(0.62 0.22 27);
+
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: oklch(0.13 0.015 250);
+    --foreground: oklch(0.96 0.005 250);
+    --muted: oklch(0.18 0.015 250);
+    --muted-foreground: oklch(0.65 0.015 250);
+    --card: oklch(0.16 0.015 250);
+    --card-foreground: oklch(0.96 0.005 250);
+    --popover: oklch(0.16 0.015 250);
+    --popover-foreground: oklch(0.96 0.005 250);
+    --border: oklch(0.24 0.015 250);
+    --input: oklch(0.24 0.015 250);
+    --primary: oklch(0.7 0.16 220);
+    --primary-foreground: oklch(0.13 0.015 250);
+    --secondary: oklch(0.2 0.015 250);
+    --secondary-foreground: oklch(0.96 0.005 250);
+    --accent: oklch(0.22 0.02 250);
+    --accent-foreground: oklch(0.96 0.005 250);
+    --destructive: oklch(0.65 0.22 27);
+    --destructive-foreground: oklch(0.99 0 0);
+    --ring: oklch(0.7 0.16 220);
+
+    --score-good: oklch(0.72 0.16 145);
+    --score-mid: oklch(0.78 0.16 80);
+    --score-bad: oklch(0.65 0.22 27);
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-score-good: var(--score-good);
+  --color-score-mid: var(--score-mid);
+  --color-score-bad: var(--score-bad);
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-feature-settings:
+      "rlig" 1,
+      "calt" 1,
+      "ss01" 1;
+  }
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 25%, transparent);
+  }
+}
+
+/* Hairline borders + subtle elevation for "Linear / Vercel" aesthetic */
+@layer utilities {
+  .surface {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+  }
+  .hairline {
+    border: 1px solid var(--border);
+  }
+}
