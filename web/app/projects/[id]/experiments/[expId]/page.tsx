@@ -18,11 +18,13 @@ import {
   useCancelExperiment,
   useDeleteExperiment,
   useExperiment,
+  useIterationStats,
   usePromptVersions,
   useRuns,
 } from "@/lib/api/hooks";
 import { formatCost, formatScore, scoreBand } from "@/lib/utils";
 import type { ExperimentStatus, PromptVersion, Run } from "@/lib/api/types";
+import type { IterationStats } from "@/lib/api/hooks";
 
 const STATUS_VARIANT: Record<ExperimentStatus, "default" | "good" | "mid" | "bad" | "outline"> = {
   pending: "outline",
@@ -46,6 +48,7 @@ export default function ExperimentPage() {
   const { data: exp } = useExperiment(expId);
   const { data: versions } = usePromptVersions(expId);
   const { data: runs } = useRuns(expId);
+  const { data: stats } = useIterationStats(expId);
   const cancelMut = useCancelExperiment(expId);
   const deleteMut = useDeleteExperiment(expId, projectId);
   const isRunning = exp ? RUNNING_STATUSES.includes(exp.status) : false;
@@ -62,13 +65,25 @@ export default function ExperimentPage() {
     router.push(`/projects/${projectId}`);
   };
 
-  const trajectory = useMemo(() => buildTrajectory(runs), [runs]);
+  const trajectory = useMemo(() => buildTrajectory(stats?.iterations), [stats]);
   const gap = useMemo(() => buildGap(trajectory), [trajectory]);
   const bestHoldout = useMemo(() => {
-    if (!runs) return null;
-    const scores = runs.filter((r) => r.split === "holdout" && r.mean_score != null).map((r) => r.mean_score as number);
-    return scores.length ? Math.max(...scores) : null;
-  }, [runs]);
+    if (!stats) return null;
+    // Lower-confidence-bound: prefer robust prompts over noisy lucky-streaks
+    let bestLcb: number | null = null;
+    let bestMean: number | null = null;
+    for (const it of stats.iterations) {
+      const h = it.holdout;
+      if (h.mean == null || h.n < 1) continue;
+      const se = h.se ?? 0;
+      const lcb = h.mean - 1.96 * se;
+      if (bestLcb == null || lcb > bestLcb) {
+        bestLcb = lcb;
+        bestMean = h.mean;
+      }
+    }
+    return bestMean;
+  }, [stats]);
 
   return (
     <div className="flex h-[calc(100vh-3rem)] gap-0 -m-6 lg:-mr-8">
@@ -283,20 +298,21 @@ function avgScore(runs: Run[]): string {
   return formatScore(scores.reduce((a, b) => a + b, 0) / scores.length);
 }
 
-function buildTrajectory(runs: Run[] | undefined): TrajectoryPoint[] {
-  if (!runs) return [];
-  const byIter = new Map<number, { train: number[]; holdout: number[] }>();
-  for (const r of runs) {
-    if (r.mean_score == null) continue;
-    if (!byIter.has(r.iteration)) byIter.set(r.iteration, { train: [], holdout: [] });
-    byIter.get(r.iteration)![r.split].push(r.mean_score);
-  }
-  return Array.from(byIter.entries())
-    .sort(([a], [b]) => a - b)
-    .map(([iter, v]) => ({
-      iteration: iter,
-      train: v.train.length ? avg(v.train) : null,
-      holdout: v.holdout.length ? avg(v.holdout) : null,
+function buildTrajectory(
+  iterations: IterationStats["iterations"] | undefined,
+): TrajectoryPoint[] {
+  if (!iterations) return [];
+  return iterations
+    .slice()
+    .sort((a, b) => a.iteration - b.iteration)
+    .map((it) => ({
+      iteration: it.iteration,
+      train: it.train.mean,
+      holdout: it.holdout.mean,
+      train_ci: it.train.ci_half_width ?? null,
+      holdout_ci: it.holdout.ci_half_width ?? null,
+      train_n: it.train.n,
+      holdout_n: it.holdout.n,
     }));
 }
 
@@ -310,4 +326,9 @@ function buildGap(trajectory: TrajectoryPoint[]): GapPoint[] {
 
 function avg(arr: number[]): number {
   return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function _unused_runs(runs: Run[]) {
+  return runs;
 }

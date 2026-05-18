@@ -32,6 +32,23 @@ export type SettingsStatus = {
   };
 };
 
+export type IterationStat = {
+  mean: number | null;
+  std: number | null;
+  n: number;
+  se: number | null;
+  ci_half_width: number | null;
+};
+
+export type IterationStats = {
+  iterations: Array<{
+    iteration: number;
+    prompt_version_id: string | null;
+    train: IterationStat;
+    holdout: IterationStat;
+  }>;
+};
+
 export function useProjects() {
   return useQuery({
     queryKey: ["projects"],
@@ -174,6 +191,15 @@ export function useRuns(experimentId: string) {
   return useQuery({
     queryKey: ["experiments", experimentId, "runs"],
     queryFn: () => api.get<Run[]>(`/experiments/${experimentId}/runs`),
+    refetchInterval: 2000,
+  });
+}
+
+export function useIterationStats(experimentId: string) {
+  return useQuery({
+    queryKey: ["experiments", experimentId, "iteration-stats"],
+    queryFn: () =>
+      api.get<IterationStats>(`/experiments/${experimentId}/iteration-stats`),
     refetchInterval: 2000,
   });
 }

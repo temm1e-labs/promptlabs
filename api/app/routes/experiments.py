@@ -1,5 +1,7 @@
 import asyncio
 import json
+import math
+import statistics
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -11,13 +13,42 @@ from sqlalchemy.orm import selectinload
 
 from app.core.db import get_session
 from app.core.sse import bus
-from app.models.evalset import EvalSet
+from app.models.evalset import EvalSet, Split
 from app.models.experiment import Experiment, ExperimentStatus
 from app.models.project import Project
 from app.models.prompt import PromptVersion
-from app.models.run import Run
+from app.models.run import Run, RunResult
 from app.schemas.experiment import ExperimentCreate, ExperimentOut, ExperimentSummary
 from app.services import experiment_loop
+
+
+def _stats(values: list[float]) -> dict[str, float | int | None]:
+    """Per-iteration sample statistics. Returns mean, std, n, and 95% CI half-width.
+
+    Std uses Bessel's correction (n-1 denominator). CI half-width is the
+    standard error of the mean times 1.96 (~95% normal approximation).
+    """
+    n = len(values)
+    if n == 0:
+        return {"mean": None, "std": None, "n": 0, "ci_half_width": None, "se": None}
+    if n == 1:
+        return {
+            "mean": values[0],
+            "std": 0.0,
+            "n": 1,
+            "ci_half_width": None,
+            "se": None,
+        }
+    mean = statistics.fmean(values)
+    std = statistics.stdev(values)
+    se = std / math.sqrt(n)
+    return {
+        "mean": mean,
+        "std": std,
+        "n": n,
+        "se": se,
+        "ci_half_width": 1.96 * se,
+    }
 
 router = APIRouter(tags=["experiments"])
 
@@ -208,6 +239,50 @@ async def accept_iteration(
     return _to_out(e)
 
 
+@router.get("/experiments/{experiment_id}/iteration-stats", response_model=dict[str, Any])
+async def get_iteration_stats(
+    experiment_id: str,
+    db: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Per-iteration sample statistics: mean ± SE + 95% CI half-width.
+
+    The Run.mean_score that the orchestrator persists is a single number per
+    (iteration, split, target_model). This endpoint aggregates the per-item
+    RunResult.mean_score back into a sampling distribution and reports the
+    proper sampling stats. That's what the UI needs to draw error bars.
+    """
+    stmt = (
+        select(RunResult, Run.iteration, Run.split, Run.prompt_version_id)
+        .join(Run, Run.id == RunResult.run_id)
+        .where(Run.experiment_id == experiment_id)
+        .order_by(Run.iteration.asc())
+    )
+    rows = (await db.execute(stmt)).all()
+
+    # Group per-item scores by (iteration, split)
+    grouped: dict[tuple[int, str], list[float]] = {}
+    version_by_iter: dict[int, str] = {}
+    for run_result, iteration, split, prompt_version_id in rows:
+        key = (iteration, split.value)
+        grouped.setdefault(key, []).append(run_result.mean_score)
+        version_by_iter.setdefault(iteration, prompt_version_id)
+
+    iterations: list[dict[str, Any]] = []
+    for iter_n in sorted({i for i, _ in grouped.keys()}):
+        train_scores = grouped.get((iter_n, "train"), [])
+        holdout_scores = grouped.get((iter_n, "holdout"), [])
+        iterations.append(
+            {
+                "iteration": iter_n,
+                "prompt_version_id": version_by_iter.get(iter_n),
+                "train": _stats(train_scores),
+                "holdout": _stats(holdout_scores),
+            }
+        )
+
+    return {"iterations": iterations}
+
+
 @router.get("/experiments/{experiment_id}/best-prompt", response_model=dict[str, Any])
 async def get_best_prompt(
     experiment_id: str,
@@ -242,17 +317,54 @@ async def get_best_prompt(
         selection_reason = "accepted"
 
     if version is None:
-        # Pick the iteration with the highest mean HOLDOUT score
-        holdout_stmt = (
-            select(Run.iteration, Run.prompt_version_id, Run.mean_score)
-            .where(Run.experiment_id == experiment_id, Run.split == "holdout")
-            .order_by(Run.mean_score.desc().nulls_last())
-            .limit(1)
+        # Lower-confidence-bound selection: argmax over (mean - 1.96 * SE).
+        # This prefers robust prompts over lucky-streak high-variance ones.
+        # On small holdout sets the difference matters: a v with 0.92 ± 0.10
+        # has LCB ~0.72; a v with 0.91 ± 0.04 has LCB ~0.83. The latter is the
+        # safer production choice even though its mean is lower.
+        per_item_stmt = (
+            select(RunResult.mean_score, Run.iteration, Run.prompt_version_id)
+            .join(Run, Run.id == RunResult.run_id)
+            .where(Run.experiment_id == experiment_id, Run.split == Split.HOLDOUT)
         )
-        row = (await db.execute(holdout_stmt)).first()
-        if row is not None:
-            version = await db.get(PromptVersion, row.prompt_version_id)
-            selection_reason = f"best_holdout (iter {row.iteration}, score {row.mean_score})"
+        per_item_rows = (await db.execute(per_item_stmt)).all()
+        # Group per-item holdout scores by iteration
+        scores_by_iter: dict[int, list[float]] = {}
+        version_by_iter: dict[int, str] = {}
+        for score, iteration, prompt_version_id in per_item_rows:
+            if score is not None:
+                scores_by_iter.setdefault(iteration, []).append(score)
+                version_by_iter[iteration] = prompt_version_id
+
+        best_iter: int | None = None
+        best_lcb: float | None = None
+        best_mean: float | None = None
+        best_se: float | None = None
+        for iteration, scores in scores_by_iter.items():
+            stats = _stats(scores)
+            mean = stats["mean"]
+            n = stats["n"]
+            std = stats["std"]
+            if mean is None or n is None or std is None or n < 1:
+                continue
+            n_int = int(n)
+            se = float(std) / math.sqrt(n_int) if n_int > 0 else 0.0
+            lcb = float(mean) - 1.96 * se
+            if best_lcb is None or lcb > best_lcb:
+                best_lcb = lcb
+                best_iter = iteration
+                best_mean = float(mean)
+                best_se = se
+
+        if best_iter is not None:
+            version = await db.get(PromptVersion, version_by_iter[best_iter])
+            mean_str = f"{best_mean:.3f}" if best_mean is not None else "?"
+            se_str = f"{best_se:.3f}" if best_se is not None else "?"
+            lcb_str = f"{best_lcb:.3f}" if best_lcb is not None else "?"
+            selection_reason = (
+                f"best_lcb (iter {best_iter}, mean={mean_str}, "
+                f"se={se_str}, lcb={lcb_str})"
+            )
         else:
             # Fallback: most recent prompt version
             recent_stmt = (

@@ -113,49 +113,90 @@ else. Target models — the models being *tested* — are a separate axis.
 
 ## The science (why each guardrail exists)
 
-### Train / holdout split
+### Train / holdout split — what it actually controls for
 
 Goodhart: *when a measure becomes a target, it ceases to be a good measure*.
-If the Optimizer can see every eval item, it'll converge to memorize them —
-producing prompts that look great on the eval but fail in production.
+If the Optimizer can see every eval item, it'll memorize them — prompts look
+great on the eval and fail in production.
 
-Mitigation: a hard split. The Optimizer is fed the rubric, the current prompt,
-and **failure samples drawn from the train pool only**. The holdout pool is
-only used to *measure*, never to *steer*.
+Mitigation: a **shuffled, deterministic** split. Items are shuffled by a
+per-experiment seed before slicing — without this, the LLM's tendency to emit
+common cases first, adversarial last makes train systematically easier than
+holdout. The Optimizer is fed the rubric, the current prompt, and failure
+samples from the train pool only.
 
 ```
 Items: 50
-Train: 35  ← Optimizer sees these
-Holdout: 15  ← Optimizer never sees these
+Train: 35  ← Optimizer sees these       (shuffled subset)
+Holdout: 15  ← Optimizer never sees these (shuffled subset)
+seed: SHA256(experiment_id)[:8]         (deterministic, per-experiment)
 ```
 
-### Train-vs-holdout gap as the overfit detector
+**What this does NOT control for** (be honest with yourself):
 
-Define for each iteration:
+- *In-distribution overfitting only.* Both splits come from one EvalGen call.
+  If EvalGen has a blind spot (no multilingual, no injection attempts), the
+  holdout is just as blind. The loop happily converges on prompts that fail
+  on out-of-distribution inputs.
+- *Rubric leakage.* The rubric was generated alongside the items, so its
+  criteria implicitly reflect knowledge of the holdout. The Optimizer sees
+  the rubric.
+
+### Overfit detector — divergence-based, sample-size aware
+
+Per-iteration train/holdout means and their 3-iteration changes:
 
 ```
-train_mean[n]   = mean(judge_score(item) for item in train, using v_n)
-holdout_mean[n] = mean(judge_score(item) for item in holdout, using v_n)
-gap[n]          = train_mean[n] − holdout_mean[n]
+Δtrain[n]   = train_mean[n] − train_mean[n-3]
+Δholdout[n] = holdout_mean[n] − holdout_mean[n-3]
 ```
 
-Overfitting is the regime where `train_mean` rises while `holdout_mean` falls
-or stagnates. The detector fires when **both**:
+Overfit is **divergence** — train rising AND holdout falling. The detector:
 
 ```
-holdout_mean[n-3] − holdout_mean[n]  ≥  0.04       (holdout dropped ≥4pp over 3 iters)
-train_mean[n]     − holdout_mean[n]  ≥  0.05       (current gap ≥5pp)
+τ(N) = 1.96 · σ / √N                    (95% CI half-width; σ ≈ 0.2)
+overfit ⇔ Δtrain[n] ≥ τ(N_train)        AND
+          Δholdout[n] ≤ −τ(N_holdout)
 ```
 
-The dual condition matters: with small eval sets (N=10–30 per split), a single
-item flipping its score moves the average by ~3–10pp purely from grading noise.
-Requiring a *sustained* drop **and** a widened gap filters that out.
+Each side's threshold scales with that side's sample size, so the rule
+behaves consistently from Quick (N=20) through Thorough (N=100). Co-regression
+(both falling) and co-improvement (both rising) explicitly do **not** trigger.
 
-### Convergence
+### Convergence — sample-size aware plateau
 
-`train_mean` plateau detection: if the last 3 iterations' train means differ by
-less than `δ = 0.01`, the experiment is marked **converged**. No point burning
-more LLM calls if signal is flat.
+```
+δ(N) = 1.96 · σ / √N
+converged ⇔ max(train_mean[n-2:n+1]) − min(train_mean[n-2:n+1]) < δ(N_train)
+```
+
+i.e. the last three iterations' means are within the per-iteration noise floor.
+No point burning more LLM calls when the signal is below the noise.
+
+### Reporting variance — what the chart actually shows
+
+Every score line in the lab notebook now includes a **95% confidence band**:
+
+```
+mean ± 1.96 · σ̂/√N
+```
+
+where σ̂ is the per-item std of `mean_score` across all RunResults in that
+iteration/split. A `(N=15)` badge in the tooltip reminds you what you're
+looking at. A wide band on N=6 means the point estimate is not a measurement.
+
+### Production selection — lower confidence bound, not greedy max
+
+`GET /experiments/{id}/best-prompt` picks the prompt to serve via:
+
+```
+LCB(v) = mean_holdout(v) − 1.96 · σ̂_holdout(v) / √N_holdout(v)
+v* = argmax_v LCB(v)                    (after any user-accepted iteration)
+```
+
+Greedy max favors high-variance lucky-streak prompts. LCB favors robust ones.
+On small holdout sets (N ≤ 15) the two rules pick different winners often
+enough to matter — LCB is the safer default for production.
 
 ### Weighted scoring
 
@@ -208,6 +249,22 @@ Three reasons this matters:
    - Reverts to v_{n-1} on validation failure rather than persisting a broken
      prompt.
 
+### Failure-sample selection — stratified, not greedy
+
+The Optimizer receives `k=8` failure samples per iteration. Selection is
+**stratified by failing criterion**:
+
+```
+pass 1: for each rubric criterion c:
+            pick the lowest-scoring train item where score(c) < 0.5
+            (one exemplar per criterion that's actually failing)
+pass 2: fill remaining slots up to k with next-lowest overall failures
+```
+
+Previous behavior (top-k by mean score) collapsed when many items failed the
+same criterion — the Optimizer saw 8 duplicates of "format wrong" and missed
+the items failing "robustness". Stratified sampling gives balanced edit signal.
+
 ### Budget as a hard constraint
 
 Every LLM call adds its cost (from `litellm.completion_cost`) to
@@ -247,6 +304,52 @@ text.
   matters. Always read the failure samples in the lab notebook.
 - Not magic. If the LLM driving the agents is unreliable (e.g. some preview
   models flake at structured output), the loop degrades.
+
+## Honest limitations of the methodology
+
+The closed loop is well-instrumented but the **measurements have boundaries**.
+These are the ones a real user should understand before trusting a score:
+
+1. **Internal validity only, not external validity.** A 95% holdout score
+   means *"this prompt does well on an LLM-generated eval set, graded by
+   another LLM."* It does NOT mean 95% accuracy on your production traffic.
+   Always re-measure with real data once a prompt is deployed.
+
+2. **In-distribution overfit detection only.** Train and holdout both come
+   from a single EvalGen call. If EvalGen has blind spots (no multilingual
+   inputs, no prompt-injection probes, no adversarial code-switching), both
+   splits miss the same failure modes.
+
+3. **Greedy multi-target optimization.** With multiple target models the
+   Optimizer's failure samples are aggregated; the prompt drifts toward
+   whichever model's failures dominate. This is "compare on the same prompt",
+   not "fairly A/B-test optimized prompts." Per-target Optimizer is on the
+   roadmap.
+
+4. **Power limits at small N.** Quick preset (N=20, holdout=6) can detect a
+   ~12pp improvement reliably. Anything smaller is below the noise floor.
+   Use Standard (N=50) or Thorough (N=100) when the change you care about is
+   ≤5pp.
+
+5. **Reproducibility is partial.** The train/holdout split is deterministic
+   per experiment (seeded by `SHA256(experiment_id)`). The eval items
+   themselves are LLM-generated and **not** byte-reproducible across runs.
+   Re-running an experiment with the same intent gets a similar — but not
+   identical — eval set.
+
+6. **The judge has no ground truth.** LLM-graded scores in `[0, 1]` are
+   subjective fuzzy values, not probabilities. The aggregate "best score"
+   is opinionated by an LLM with no domain expertise. Read failure samples.
+
+7. **Rubric leakage.** EvalGen produces the rubric and the items in the same
+   call, so the rubric's criteria implicitly reflect knowledge of the
+   holdout. The Optimizer sees the rubric. This is a real (if subtle)
+   information leak that we haven't yet plugged.
+
+When all this is acknowledged, the system is what it is: **an instrumented
+fast loop for prompt iteration with honest error bars, sample-size-aware
+guardrails, and a defensible production selection rule.** That's a useful
+thing. It is not "automatic prompt optimization with statistical guarantees."
 
 ---
 
