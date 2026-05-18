@@ -206,6 +206,61 @@ async def test_generate_fills_missing_context_vars_from_example() -> None:
 
 
 @pytest.mark.asyncio
+async def test_generate_salvages_items_with_unrelated_keys() -> None:
+    """Last-resort salvage: EvalGen invented its own key names that don't match
+    declared variables. The longest non-empty string value gets mapped to the
+    most-input-like declared var; missing context vars are filled from example.
+    Without this, smaller/preview models that don't follow the schema strictly
+    cause every item to be dropped."""
+    items = [
+        {
+            "label": "invented keys",
+            # EvalGen used 'query' and 'knowledge' but declared vars are
+            # 'context' and 'customer_query' — names don't match at all,
+            # not even case-insensitively, and counts happen to differ
+            # because the model omitted a key
+            "input_vars": {"query": "Where do you stock dog leashes?"},
+            "expected_output": None,
+            "tags": [],
+        },
+    ]
+    with (
+        patch(
+            "app.core.providers.litellm.acompletion",
+            AsyncMock(return_value=_fake_response(_payload(items))),
+        ),
+        patch("app.core.providers.litellm.completion_cost", return_value=0.0),
+    ):
+        result = await generate(
+            intent="customer support",
+            prompt_v0="{{context}} -- {{customer_query}}",
+            variables=[
+                PromptVariable(name="context", description="info", example_value="Pet Mart, est 2010"),
+                PromptVariable(
+                    name="customer_query",
+                    description="user q",
+                    example_value="Do you sell parrot food?",
+                ),
+            ],
+            objectives=["accuracy"],
+            known_issues=None,
+            eval_size=1,
+            train_ratio=0.5,
+            model="openai/gpt-5",
+        )
+
+    kept = result.train_items + result.holdout_items
+    assert len(kept) == 1
+    item = kept[0]
+    # Both declared vars present
+    assert set(item.input_vars.keys()) == {"context", "customer_query"}
+    # The user query string ended up in customer_query (most input-like name)
+    assert item.input_vars["customer_query"] == "Where do you stock dog leashes?"
+    # The context var got the declared example value
+    assert item.input_vars["context"] == "Pet Mart, est 2010"
+
+
+@pytest.mark.asyncio
 async def test_generate_handles_malformed_response_gracefully() -> None:
     with (
         patch(

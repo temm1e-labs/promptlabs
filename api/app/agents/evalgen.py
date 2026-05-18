@@ -435,24 +435,46 @@ def _build_user_topup(
 # of these keywords as the target for the input_text. Falls back to the
 # LAST declared variable, since prompt templates conventionally place the
 # user's turn at the end.
-_INPUT_LIKE_KEYWORDS = (
-    "query", "question", "input", "user_input", "user_message", "message",
-    "prompt", "text", "request", "inquiry", "ask", "user",
+_INPUT_LIKE_KEYWORDS = frozenset(
+    {
+        "query", "question", "input", "user_input", "user_message", "message",
+        "prompt", "text", "request", "inquiry", "ask", "user", "utterance",
+        "turn", "msg",
+    }
 )
+
+
+def _name_tokens(name: str) -> set[str]:
+    """Split a variable name into normalized tokens for keyword matching.
+
+    'customer_query' → {'customer', 'query'}
+    'userInputText' → {'user', 'input', 'text'}    'context' → {'context'}
+
+    Used by _pick_input_var so substring false positives don't fire
+    (e.g., 'text' is a substring of 'context' but they aren't the same token).
+    """
+    # Split on underscores AND camelCase boundaries
+    import re
+    parts: list[str] = []
+    for piece in name.split("_"):
+        # Split camelCase (insert space before uppercase, then lowercase)
+        camel_split = re.sub(r"(?<!^)(?=[A-Z])", "_", piece).split("_")
+        parts.extend(p.lower() for p in camel_split if p)
+    return set(parts)
 
 
 def _pick_input_var(variables: list[PromptVariable]) -> int:
     """Return the index of the variable most likely to hold the user's input.
 
     Heuristic:
-      1. First variable whose name contains a known "input-like" keyword.
+      1. First variable with a TOKEN matching a known input-like keyword.
+         Token-based (not substring) so 'text' in 'context' doesn't fire.
       2. Otherwise, the LAST variable (conventional placement of user turn).
     """
     if not variables:
         return 0
     for i, v in enumerate(variables):
-        lname = v.name.lower()
-        if any(kw in lname for kw in _INPUT_LIKE_KEYWORDS):
+        if _name_tokens(v.name) & _INPUT_LIKE_KEYWORDS:
             return i
     return len(variables) - 1
 
@@ -537,6 +559,22 @@ def _reconcile_item(
                 result[v.name] = _example_default(v)
         return result
 
+    # (6) FINAL SALVAGE: item has input_vars with unrelated keys but non-empty
+    # string content. Treat the longest non-empty string value as the user's
+    # input (most likely the test case the model meant to generate), map it
+    # to the most-input-like declared var, fill the rest from example_value.
+    # This is the catch-all for when EvalGen invents its own key names that
+    # don't match declared variables — common with smaller/preview models.
+    if item_vars:
+        candidates = [s for s in item_vars.values() if isinstance(s, str) and s.strip()]
+        if candidates:
+            longest = max(candidates, key=len)
+            idx = _pick_input_var(variables)
+            result = {}
+            for i, v in enumerate(variables):
+                result[v.name] = longest if i == idx else _example_default(v)
+            return result
+
     return None
 
 
@@ -546,13 +584,26 @@ def _filter_items(
 ) -> list[GeneratedEvalItem]:
     """Reconcile each item's input data with the declared prompt variables.
 
-    Items whose inputs can't be reconciled are dropped (logged for visibility).
+    Items whose inputs can't be reconciled are dropped. When the drop rate is
+    high, a WARNING is emitted with a sample of the dropped items' shape so
+    operators can see why reconciliation failed (e.g., EvalGen used different
+    variable names than declared).
     """
     declared_var_names = [v.name for v in variables]
     kept: list[GeneratedEvalItem] = []
+    dropped_samples: list[dict[str, Any]] = []
     for item in items:
         reconciled = _reconcile_item(item, variables)
         if reconciled is None:
+            if len(dropped_samples) < 3:
+                dropped_samples.append(
+                    {
+                        "label": item.label,
+                        "provided_vars": sorted((item.input_vars or {}).keys()),
+                        "has_input_text": bool(item.input_text),
+                        "input_text_preview": (item.input_text or "")[:80],
+                    }
+                )
             log.debug(
                 "evalgen.item_dropped",
                 label=item.label,
@@ -562,6 +613,18 @@ def _filter_items(
             )
             continue
         kept.append(item.model_copy(update={"input_vars": reconciled}))
+
+    n_dropped = len(items) - len(kept)
+    # Surface details when the drop rate is non-trivial — silent drops were
+    # the hard-to-diagnose failure that made earlier loops fail with 0 items.
+    if n_dropped > 0 and (n_dropped >= 3 or n_dropped == len(items)):
+        log.warning(
+            "evalgen.reconcile_drops",
+            n_dropped=n_dropped,
+            n_total=len(items),
+            declared=declared_var_names,
+            sample=dropped_samples,
+        )
     return kept
 
 
