@@ -625,17 +625,18 @@ async def run_experiment(
             )
             all_items = list((await db.execute(items_stmt)).scalars().all())
             if not all_items:
-                await _set_status(
-                    db,
-                    experiment,
-                    ExperimentStatus.FAILED,
-                    "evalgen produced no usable items (variable-name mismatch?)",
+                declared = [v.name for v in writer_result.output.variables]
+                reason = (
+                    "EvalGen produced 0 usable items after reconciliation. "
+                    f"Declared variables: {declared}. "
+                    "Common causes: the agent model couldn't reliably fill all "
+                    "declared variables for multi-var prompts, or returned items "
+                    "with no input_text/input_vars at all. Try a more capable "
+                    "agent model (e.g. gemini-2.5-flash) or simplify the prompt "
+                    "template to fewer variables."
                 )
-                await _emit(
-                    experiment_id,
-                    "loop.failed",
-                    error="evalgen produced no usable items",
-                )
+                await _set_status(db, experiment, ExperimentStatus.FAILED, reason)
+                await _emit(experiment_id, "loop.failed", error=reason)
                 return
             train_items = [i for i in all_items if i.split == Split.TRAIN]
             holdout_items = [i for i in all_items if i.split == Split.HOLDOUT]

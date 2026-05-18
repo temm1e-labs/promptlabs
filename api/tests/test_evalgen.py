@@ -79,15 +79,21 @@ async def test_generate_basic_split_and_rubric() -> None:
 
 
 @pytest.mark.asyncio
-async def test_generate_filters_items_with_wrong_variable_keys() -> None:
+async def test_generate_reconciles_items_leniently() -> None:
+    """Lenient reconciliation: items with recoverable shape are kept and
+    normalized. Only items with nothing usable (no input_vars AND no
+    input_text) get dropped. This is intentional — strict filtering used
+    to drop every item when EvalGen omitted context vars on a multi-var
+    prompt, causing the loop to fail with 'no usable items'."""
     items = [
+        # Exact match — kept as-is
         {"label": "good", "input_vars": {"email": "x"}, "expected_output": None, "tags": []},
-        # missing var
-        {"label": "missing", "input_vars": {}, "expected_output": None, "tags": []},
-        # extra var
+        # Both empty — dropped
+        {"label": "empty", "input_vars": {}, "expected_output": None, "tags": []},
+        # Extra keys — trimmed to declared, kept (distinct value so dedup doesn't drop it)
         {
-            "label": "extra",
-            "input_vars": {"email": "x", "ghost": "y"},
+            "label": "trimmed",
+            "input_vars": {"email": "z", "ghost": "y"},
             "expected_output": None,
             "tags": [],
         },
@@ -112,8 +118,91 @@ async def test_generate_filters_items_with_wrong_variable_keys() -> None:
         )
 
     all_kept = result.train_items + result.holdout_items
-    labels = [item.label for item in all_kept]
-    assert labels == ["good", "good2"]
+    labels = {item.label for item in all_kept}
+    # "empty" dropped; others recovered. "trimmed" loses the bogus "ghost" key.
+    assert "empty" not in labels
+    assert labels == {"good", "trimmed", "good2"}
+    # The "trimmed" item should have just the declared var
+    trimmed = next(i for i in all_kept if i.label == "trimmed")
+    assert set(trimmed.input_vars.keys()) == {"email"}
+
+
+@pytest.mark.asyncio
+async def test_generate_fills_missing_context_vars_from_example() -> None:
+    """The real user scenario: a multi-variable prompt where EvalGen only varies
+    the user-input var per test case. Missing context vars get filled from
+    each variable's example_value so the items remain valid.
+
+    This was the v0.4 bug — strict reconciliation dropped every item when the
+    Writer chose a multi-var template and EvalGen only filled the user-input
+    var, causing the loop to fail with 'evalgen produced no usable items'.
+    """
+    items = [
+        {
+            "label": "billing question",
+            # Only the user-facing var is populated — context vars omitted
+            "input_vars": {"customer_query": "Why is my bill higher this month?"},
+            "expected_output": None,
+            "tags": ["common"],
+        },
+        {
+            "label": "input_text fallback",
+            # No input_vars at all; input_text should map to most-input-like var
+            "input_text": "Is the store open on Sundays?",
+            "input_vars": {},
+            "expected_output": None,
+            "tags": ["common"],
+        },
+    ]
+    with (
+        patch(
+            "app.core.providers.litellm.acompletion",
+            AsyncMock(return_value=_fake_response(_payload(items))),
+        ),
+        patch("app.core.providers.litellm.completion_cost", return_value=0.0),
+    ):
+        result = await generate(
+            intent="customer support",
+            prompt_v0="store: {{store_info}}, inventory: {{inventory_status}}, query: {{customer_query}}",
+            variables=[
+                PromptVariable(
+                    name="store_info",
+                    description="basic store info",
+                    example_value="ACME Pet Store, est 2010",
+                ),
+                PromptVariable(
+                    name="inventory_status",
+                    description="current stock",
+                    example_value="dog food, cat food, fish tanks in stock",
+                ),
+                PromptVariable(
+                    name="customer_query",
+                    description="the user's question",
+                    example_value="Do you have parrot food?",
+                ),
+            ],
+            objectives=["accuracy"],
+            known_issues=None,
+            eval_size=2,
+            train_ratio=0.5,
+            model="openai/gpt-5",
+        )
+
+    kept = result.train_items + result.holdout_items
+    assert len(kept) == 2
+    # Both items should have all 3 vars populated
+    for item in kept:
+        assert set(item.input_vars.keys()) == {"store_info", "inventory_status", "customer_query"}
+    # The billing-question item should preserve its customer_query value
+    billing = next(i for i in kept if i.label == "billing question")
+    assert billing.input_vars["customer_query"] == "Why is my bill higher this month?"
+    # Missing context vars filled from example_value
+    assert billing.input_vars["store_info"] == "ACME Pet Store, est 2010"
+    # The input_text fallback item should map input_text to customer_query
+    # (the most "input-like" variable name)
+    text_item = next(i for i in kept if i.label == "input_text fallback")
+    assert text_item.input_vars["customer_query"] == "Is the store open on Sundays?"
+    assert text_item.input_vars["store_info"] == "ACME Pet Store, est 2010"
 
 
 @pytest.mark.asyncio

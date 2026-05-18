@@ -429,9 +429,42 @@ def _build_user_topup(
 # ─── reconciliation + dedup ──────────────────────────────────────────────
 
 
+# Keywords that suggest a variable is the user-facing input (vs context).
+# When EvalGen produces an item with `input_text` only but the prompt has
+# multiple declared variables, we pick the variable whose name contains one
+# of these keywords as the target for the input_text. Falls back to the
+# LAST declared variable, since prompt templates conventionally place the
+# user's turn at the end.
+_INPUT_LIKE_KEYWORDS = (
+    "query", "question", "input", "user_input", "user_message", "message",
+    "prompt", "text", "request", "inquiry", "ask", "user",
+)
+
+
+def _pick_input_var(variables: list[PromptVariable]) -> int:
+    """Return the index of the variable most likely to hold the user's input.
+
+    Heuristic:
+      1. First variable whose name contains a known "input-like" keyword.
+      2. Otherwise, the LAST variable (conventional placement of user turn).
+    """
+    if not variables:
+        return 0
+    for i, v in enumerate(variables):
+        lname = v.name.lower()
+        if any(kw in lname for kw in _INPUT_LIKE_KEYWORDS):
+            return i
+    return len(variables) - 1
+
+
+def _example_default(v: PromptVariable) -> str:
+    """Sensible default value for a context variable when EvalGen omitted it."""
+    return v.example_value or ""
+
+
 def _reconcile_item(
     item: GeneratedEvalItem,
-    declared_keys: list[str],
+    variables: list[PromptVariable],
 ) -> dict[str, str] | None:
     """Return the reconciled input_vars dict, or None if irrecoverable.
 
@@ -439,29 +472,69 @@ def _reconcile_item(
       1. input_vars exact-match declared keys → use as-is.
       2. input_vars case-insensitive match → rename.
       3. input_vars same-count, different keys → positional remap.
-      4. input_vars empty but input_text present → map input_text to first declared var.
-      5. input_vars empty AND input_text empty → drop.
+      4. input_vars is a non-empty subset of declared → fill missing keys
+         with their `example_value`. This handles the common multi-variable
+         case where the prompt has context vars (e.g. {{store_info}}) plus
+         one user-facing var (e.g. {{customer_query}}), and EvalGen only
+         varies the user-facing one per test case.
+      5. input_text present + multi-var prompt → map input_text to the
+         most "input-like" declared var (by name keyword), fill the rest
+         from example_value. Single-var prompt falls through to mapping
+         input_text to the lone var.
+      6. Nothing usable → drop.
     """
+    declared_keys = [v.name for v in variables]
+    if not declared_keys:
+        return None
     declared = set(declared_keys)
     item_vars = item.input_vars or {}
 
+    # (1) exact match
     if item_vars and set(item_vars.keys()) == declared:
         return dict(item_vars)
 
+    # (2) case-insensitive match
     if item_vars:
         lower_to_actual = {k.lower(): k for k in item_vars}
         if {k.lower() for k in declared_keys} == set(lower_to_actual.keys()):
             return {dk: item_vars[lower_to_actual[dk.lower()]] for dk in declared_keys}
 
+    # (3) positional (same count, different keys, single-var case included)
     if item_vars and len(item_vars) == len(declared_keys) and len(declared_keys) >= 1:
         item_keys = list(item_vars.keys())
         return {declared_keys[i]: item_vars[item_keys[i]] for i in range(len(declared_keys))}
 
-    if item.input_text and len(declared_keys) >= 1:
-        result = {declared_keys[0]: item.input_text}
-        for k in declared_keys[1:]:
-            if k in item_vars:
-                result[k] = item_vars[k]
+    # (4) PARTIAL: item has SOME declared vars — fill missing from example_value.
+    # Handles the common case of multi-var prompts where EvalGen only varies
+    # the user-input var per test case and omits context vars.
+    if item_vars:
+        # Match keys case-insensitively to be lenient
+        lower_to_actual = {k.lower(): k for k in item_vars}
+        result: dict[str, str] = {}
+        matched_any = False
+        for v in variables:
+            if v.name in item_vars:
+                result[v.name] = item_vars[v.name]
+                matched_any = True
+            elif v.name.lower() in lower_to_actual:
+                result[v.name] = item_vars[lower_to_actual[v.name.lower()]]
+                matched_any = True
+            else:
+                result[v.name] = _example_default(v)
+        if matched_any:
+            return result
+
+    # (5) input_text present — map to most input-like var, fill the rest
+    if item.input_text:
+        idx = _pick_input_var(variables)
+        result = {}
+        for i, v in enumerate(variables):
+            if i == idx:
+                result[v.name] = item.input_text
+            elif v.name in item_vars:
+                result[v.name] = item_vars[v.name]
+            else:
+                result[v.name] = _example_default(v)
         return result
 
     return None
@@ -469,22 +542,23 @@ def _reconcile_item(
 
 def _filter_items(
     items: list[GeneratedEvalItem],
-    declared_vars: list[str],
+    variables: list[PromptVariable],
 ) -> list[GeneratedEvalItem]:
     """Reconcile each item's input data with the declared prompt variables.
 
     Items whose inputs can't be reconciled are dropped (logged for visibility).
     """
+    declared_var_names = [v.name for v in variables]
     kept: list[GeneratedEvalItem] = []
     for item in items:
-        reconciled = _reconcile_item(item, declared_vars)
+        reconciled = _reconcile_item(item, variables)
         if reconciled is None:
             log.debug(
                 "evalgen.item_dropped",
                 label=item.label,
                 provided_vars=sorted((item.input_vars or {}).keys()),
                 has_input_text=bool(item.input_text),
-                declared=declared_vars,
+                declared=declared_var_names,
             )
             continue
         kept.append(item.model_copy(update={"input_vars": reconciled}))
@@ -594,7 +668,7 @@ async def _generate_single(
     if isinstance(result.parsed, EvalGenOutput):
         rubric = result.parsed.rubric
         items_raw = result.parsed.items
-        items = _filter_items(items_raw, declared_var_names)
+        items = _filter_items(items_raw, variables)
         items = _dedup_items(items)
         if len(items) < len(items_raw):
             log.warning(
@@ -882,7 +956,7 @@ async def _generate_batched(
         )
 
     # 3. Reconcile + dedup
-    filtered = _filter_items(all_items, declared_var_names)
+    filtered = _filter_items(all_items, variables)
     deduped = _dedup_items(filtered)
     log.info(
         "evalgen.batched_pool",
@@ -890,6 +964,7 @@ async def _generate_batched(
         after_filter=len(filtered),
         after_dedup=len(deduped),
         target=eval_size,
+        declared_vars=declared_var_names,
     )
 
     # 4. Top-up if short
@@ -906,7 +981,7 @@ async def _generate_batched(
         )
         total_cost += topup_cost
         any_cache_hit = any_cache_hit or topup_cache
-        topup_filtered = _filter_items(topup_items, declared_var_names)
+        topup_filtered = _filter_items(topup_items, variables)
         before = len(deduped)
         combined = _dedup_items([*deduped, *topup_filtered])
         deduped = combined
