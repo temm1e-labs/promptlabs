@@ -246,61 +246,163 @@ async def get_iteration_stats(
 ) -> dict[str, Any]:
     """Per-iteration sample statistics: mean ± SE + 95% CI half-width.
 
-    The Run.mean_score that the orchestrator persists is a single number per
-    (iteration, split, target_model). This endpoint aggregates the per-item
-    RunResult.mean_score back into a sampling distribution and reports the
-    proper sampling stats. That's what the UI needs to draw error bars.
+    Returns BOTH the aggregated stats across all target models (existing
+    behavior, kept for backwards compatibility) AND a per-target-model
+    breakdown so multi-model benchmarking can be visualized without
+    collapsing flash and pro into one misleading average.
     """
     stmt = (
-        select(RunResult, Run.iteration, Run.split, Run.prompt_version_id)
+        select(
+            RunResult.mean_score,
+            Run.iteration,
+            Run.split,
+            Run.target_model,
+            Run.prompt_version_id,
+        )
         .join(Run, Run.id == RunResult.run_id)
         .where(Run.experiment_id == experiment_id)
         .order_by(Run.iteration.asc())
     )
     rows = (await db.execute(stmt)).all()
 
-    # Group per-item scores by (iteration, split)
-    grouped: dict[tuple[int, str], list[float]] = {}
+    # Aggregated across models — preserves existing shape for backwards compat
+    aggregated: dict[tuple[int, str], list[float]] = {}
+    # Per (iteration, target_model, split) → scores
+    per_model: dict[tuple[int, str, str], list[float]] = {}
     version_by_iter: dict[int, str] = {}
-    for run_result, iteration, split, prompt_version_id in rows:
-        key = (iteration, split.value)
-        grouped.setdefault(key, []).append(run_result.mean_score)
+    models_seen: set[str] = set()
+
+    for score, iteration, split, target_model, prompt_version_id in rows:
+        s_val = split.value
+        aggregated.setdefault((iteration, s_val), []).append(score)
+        per_model.setdefault((iteration, target_model, s_val), []).append(score)
         version_by_iter.setdefault(iteration, prompt_version_id)
+        models_seen.add(target_model)
+
+    target_models_sorted = sorted(models_seen)
 
     iterations: list[dict[str, Any]] = []
-    for iter_n in sorted({i for i, _ in grouped.keys()}):
-        train_scores = grouped.get((iter_n, "train"), [])
-        holdout_scores = grouped.get((iter_n, "holdout"), [])
+    for iter_n in sorted({i for i, _ in aggregated.keys()}):
+        by_model: dict[str, dict[str, Any]] = {}
+        for tm in target_models_sorted:
+            train_scores = per_model.get((iter_n, tm, "train"), [])
+            holdout_scores = per_model.get((iter_n, tm, "holdout"), [])
+            # Only include this model in this iteration if it has any data here.
+            # Otherwise the chart would draw a phantom "0%" point for a model
+            # whose run hadn't completed when the iteration was persisted.
+            if not train_scores and not holdout_scores:
+                continue
+            by_model[tm] = {
+                "train": _stats(train_scores),
+                "holdout": _stats(holdout_scores),
+            }
         iterations.append(
             {
                 "iteration": iter_n,
                 "prompt_version_id": version_by_iter.get(iter_n),
-                "train": _stats(train_scores),
-                "holdout": _stats(holdout_scores),
+                "train": _stats(aggregated.get((iter_n, "train"), [])),
+                "holdout": _stats(aggregated.get((iter_n, "holdout"), [])),
+                "by_model": by_model,
             }
         )
 
-    return {"iterations": iterations}
+    return {"iterations": iterations, "target_models": target_models_sorted}
+
+
+def _best_iter_by_lcb(
+    scores_by_iter: dict[int, list[float]],
+) -> tuple[int | None, float | None, float | None, float | None]:
+    """Pick the iteration with the highest lower-confidence-bound on holdout.
+
+    LCB = mean - 1.96 * SE. Prefers robust prompts over lucky high-variance ones.
+    Returns (best_iteration, best_mean, best_se, best_lcb), all None if no data.
+    """
+    best_iter: int | None = None
+    best_lcb: float | None = None
+    best_mean: float | None = None
+    best_se: float | None = None
+    for iteration, scores in scores_by_iter.items():
+        stats = _stats(scores)
+        mean = stats["mean"]
+        n = stats["n"]
+        std = stats["std"]
+        if mean is None or n is None or std is None or n < 1:
+            continue
+        n_int = int(n)
+        se = float(std) / math.sqrt(n_int) if n_int > 0 else 0.0
+        lcb = float(mean) - 1.96 * se
+        if best_lcb is None or lcb > best_lcb:
+            best_lcb = lcb
+            best_iter = iteration
+            best_mean = float(mean)
+            best_se = se
+    return best_iter, best_mean, best_se, best_lcb
 
 
 @router.get("/experiments/{experiment_id}/best-prompt", response_model=dict[str, Any])
 async def get_best_prompt(
     experiment_id: str,
+    target_model: str | None = None,
     db: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     """Return the prompt + metadata that downstream services should use.
 
-    Priority:
+    Top-level selection priority:
       1. The iteration the user explicitly accepted (`accepted_iteration`).
-      2. The iteration with the highest mean holdout score.
-      3. The most recent iteration if no holdout scores exist yet (e.g. mid-run).
+      2. LCB-selected iteration. If `target_model` query param is provided,
+         the LCB is computed against THAT model's holdout scores only.
+         Otherwise it's computed against all models combined (legacy behavior).
+      3. The most recent iteration if no holdout scores exist yet.
 
-    Designed for production consumption: stable JSON shape, no SQLAlchemy types leaked.
+    The response also includes `per_model`: a dict mapping each target_model
+    in this experiment to its own LCB winner. Production code that wants to
+    "ship the best version of this prompt for Sonnet" can pull from there
+    instead of relying on the aggregated global pick.
     """
     exp = await db.get(Experiment, experiment_id)
     if exp is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="experiment_not_found")
 
+    # Fetch holdout RunResults with target_model, used by both top-level and per-model.
+    per_item_stmt = (
+        select(
+            RunResult.mean_score,
+            Run.iteration,
+            Run.prompt_version_id,
+            Run.target_model,
+        )
+        .join(Run, Run.id == RunResult.run_id)
+        .where(Run.experiment_id == experiment_id, Run.split == Split.HOLDOUT)
+    )
+    per_item_rows = (await db.execute(per_item_stmt)).all()
+
+    # Bucket scores by (iteration) globally and by (iteration, target_model)
+    global_by_iter: dict[int, list[float]] = {}
+    by_model_iter: dict[str, dict[int, list[float]]] = {}
+    version_by_iter: dict[int, str] = {}
+    for score, iteration, prompt_version_id, tm in per_item_rows:
+        if score is None:
+            continue
+        global_by_iter.setdefault(iteration, []).append(score)
+        by_model_iter.setdefault(tm, {}).setdefault(iteration, []).append(score)
+        version_by_iter[iteration] = prompt_version_id
+
+    # Per-model best (always computed, regardless of which one we serve top-level)
+    per_model: dict[str, dict[str, Any]] = {}
+    for tm, scores_by_iter in by_model_iter.items():
+        best_iter, best_mean, best_se, best_lcb = _best_iter_by_lcb(scores_by_iter)
+        if best_iter is None:
+            per_model[tm] = {"iteration": None, "mean": None, "se": None, "lcb": None}
+            continue
+        per_model[tm] = {
+            "iteration": best_iter,
+            "mean": best_mean,
+            "se": best_se,
+            "lcb": best_lcb,
+            "version_id": version_by_iter.get(best_iter),
+        }
+
+    # Top-level selection
     version: PromptVersion | None = None
     selection_reason: str
 
@@ -317,44 +419,21 @@ async def get_best_prompt(
         selection_reason = "accepted"
 
     if version is None:
-        # Lower-confidence-bound selection: argmax over (mean - 1.96 * SE).
-        # This prefers robust prompts over lucky-streak high-variance ones.
-        # On small holdout sets the difference matters: a v with 0.92 ± 0.10
-        # has LCB ~0.72; a v with 0.91 ± 0.04 has LCB ~0.83. The latter is the
-        # safer production choice even though its mean is lower.
-        per_item_stmt = (
-            select(RunResult.mean_score, Run.iteration, Run.prompt_version_id)
-            .join(Run, Run.id == RunResult.run_id)
-            .where(Run.experiment_id == experiment_id, Run.split == Split.HOLDOUT)
-        )
-        per_item_rows = (await db.execute(per_item_stmt)).all()
-        # Group per-item holdout scores by iteration
-        scores_by_iter: dict[int, list[float]] = {}
-        version_by_iter: dict[int, str] = {}
-        for score, iteration, prompt_version_id in per_item_rows:
-            if score is not None:
-                scores_by_iter.setdefault(iteration, []).append(score)
-                version_by_iter[iteration] = prompt_version_id
+        # LCB selection. If target_model is specified, pick from that model's
+        # holdout pool; otherwise use the global pool (legacy behavior).
+        if target_model is not None:
+            if target_model not in by_model_iter:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    detail=f"no_holdout_scores_for_target_model: {target_model}",
+                )
+            scores_by_iter = by_model_iter[target_model]
+            reason_prefix = f"best_lcb_for[{target_model}]"
+        else:
+            scores_by_iter = global_by_iter
+            reason_prefix = "best_lcb"
 
-        best_iter: int | None = None
-        best_lcb: float | None = None
-        best_mean: float | None = None
-        best_se: float | None = None
-        for iteration, scores in scores_by_iter.items():
-            stats = _stats(scores)
-            mean = stats["mean"]
-            n = stats["n"]
-            std = stats["std"]
-            if mean is None or n is None or std is None or n < 1:
-                continue
-            n_int = int(n)
-            se = float(std) / math.sqrt(n_int) if n_int > 0 else 0.0
-            lcb = float(mean) - 1.96 * se
-            if best_lcb is None or lcb > best_lcb:
-                best_lcb = lcb
-                best_iter = iteration
-                best_mean = float(mean)
-                best_se = se
+        best_iter, best_mean, best_se, best_lcb = _best_iter_by_lcb(scores_by_iter)
 
         if best_iter is not None:
             version = await db.get(PromptVersion, version_by_iter[best_iter])
@@ -362,7 +441,7 @@ async def get_best_prompt(
             se_str = f"{best_se:.3f}" if best_se is not None else "?"
             lcb_str = f"{best_lcb:.3f}" if best_lcb is not None else "?"
             selection_reason = (
-                f"best_lcb (iter {best_iter}, mean={mean_str}, "
+                f"{reason_prefix} (iter {best_iter}, mean={mean_str}, "
                 f"se={se_str}, lcb={lcb_str})"
             )
         else:
@@ -391,6 +470,8 @@ async def get_best_prompt(
         "experiment_status": exp.status.value,
         "version_id": version.id,
         "created_at": version.created_at.isoformat(),
+        "target_model_filter": target_model,
+        "per_model": per_model,
     }
 
 

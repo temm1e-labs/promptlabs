@@ -40,14 +40,35 @@ export type IterationStat = {
   ci_half_width: number | null;
 };
 
+export type IterationModelStats = {
+  train: IterationStat;
+  holdout: IterationStat;
+};
+
 export type IterationStats = {
+  /** Sorted list of target_models that appeared in any Run for this experiment. */
+  target_models: string[];
   iterations: Array<{
     iteration: number;
     prompt_version_id: string | null;
+    /** Aggregated across all target models (legacy shape; preserved for compat). */
     train: IterationStat;
     holdout: IterationStat;
+    /** Per-target-model breakdown. Only models with data for this iteration appear. */
+    by_model: Record<string, IterationModelStats>;
   }>;
 };
+
+export type BestPromptPerModel = Record<
+  string,
+  {
+    iteration: number | null;
+    mean: number | null;
+    se: number | null;
+    lcb: number | null;
+    version_id?: string;
+  }
+>;
 
 export function useProjects() {
   return useQuery({

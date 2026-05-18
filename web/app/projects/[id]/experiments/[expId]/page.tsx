@@ -65,25 +65,15 @@ export default function ExperimentPage() {
     router.push(`/projects/${projectId}`);
   };
 
-  const trajectory = useMemo(() => buildTrajectory(stats?.iterations), [stats]);
-  const gap = useMemo(() => buildGap(trajectory), [trajectory]);
-  const bestHoldout = useMemo(() => {
-    if (!stats) return null;
-    // Lower-confidence-bound: prefer robust prompts over noisy lucky-streaks
-    let bestLcb: number | null = null;
-    let bestMean: number | null = null;
-    for (const it of stats.iterations) {
-      const h = it.holdout;
-      if (h.mean == null || h.n < 1) continue;
-      const se = h.se ?? 0;
-      const lcb = h.mean - 1.96 * se;
-      if (bestLcb == null || lcb > bestLcb) {
-        bestLcb = lcb;
-        bestMean = h.mean;
-      }
-    }
-    return bestMean;
-  }, [stats]);
+  const targetModels = stats?.target_models ?? [];
+  const isMultiModel = targetModels.length > 1;
+  const trajectory = useMemo(
+    () => buildTrajectory(stats?.iterations, targetModels),
+    [stats, targetModels],
+  );
+  const gap = useMemo(() => buildGap(trajectory, targetModels), [trajectory, targetModels]);
+  const bestPerModel = useMemo(() => bestHoldoutPerModel(stats), [stats]);
+  const bestAggregated = useMemo(() => bestHoldoutAggregated(stats), [stats]);
 
   return (
     <div className="flex h-[calc(100vh-3rem)] gap-0 -m-6 lg:-mr-8">
@@ -115,7 +105,31 @@ export default function ExperimentPage() {
             )}
           </div>
           <div className="flex items-center gap-4">
-            <Stat label="best score" value={bestHoldout != null ? formatScore(bestHoldout) : "—"} band={bestHoldout != null ? (scoreBand(bestHoldout) as "good" | "mid" | "bad") : undefined} />
+            {isMultiModel ? (
+              <>
+                {targetModels.map((m) => {
+                  const best = bestPerModel[m];
+                  return (
+                    <Stat
+                      key={m}
+                      label={`best · ${shortModel(m)}`}
+                      value={best != null ? formatScore(best) : "—"}
+                      band={best != null ? (scoreBand(best) as "good" | "mid" | "bad") : undefined}
+                    />
+                  );
+                })}
+              </>
+            ) : (
+              <Stat
+                label="best score"
+                value={bestAggregated != null ? formatScore(bestAggregated) : "—"}
+                band={
+                  bestAggregated != null
+                    ? (scoreBand(bestAggregated) as "good" | "mid" | "bad")
+                    : undefined
+                }
+              />
+            )}
             <Separator orientation="vertical" className="h-10" />
             <Stat label="iteration" value={exp ? `${exp.current_iteration} / ${exp.max_iterations}` : "—"} />
             <Separator orientation="vertical" className="h-10" />
@@ -155,7 +169,7 @@ export default function ExperimentPage() {
             <p className="mb-2 text-xs text-muted-foreground">
               Train (solid) vs holdout (dashed) per iteration. Higher is better.
             </p>
-            <ScoreTrajectory data={trajectory} />
+            <ScoreTrajectory data={trajectory} models={targetModels} />
           </Card>
           <Card className="p-5">
             <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
@@ -164,7 +178,7 @@ export default function ExperimentPage() {
             <p className="mb-2 text-xs text-muted-foreground">
               Widening gap signals overfitting. Red threshold at 10pp.
             </p>
-            <TrainHoldoutGap data={gap} />
+            <TrainHoldoutGap data={gap} models={targetModels} />
           </Card>
         </section>
 
@@ -300,35 +314,106 @@ function avgScore(runs: Run[]): string {
 
 function buildTrajectory(
   iterations: IterationStats["iterations"] | undefined,
+  targetModels: string[],
 ): TrajectoryPoint[] {
   if (!iterations) return [];
   return iterations
     .slice()
     .sort((a, b) => a.iteration - b.iteration)
-    .map((it) => ({
-      iteration: it.iteration,
-      train: it.train.mean,
-      holdout: it.holdout.mean,
-      train_ci: it.train.ci_half_width ?? null,
-      holdout_ci: it.holdout.ci_half_width ?? null,
-      train_n: it.train.n,
-      holdout_n: it.holdout.n,
-    }));
+    .map((it) => {
+      const models: TrajectoryPoint["models"] = {};
+      for (const m of targetModels) {
+        const ms = it.by_model[m];
+        if (!ms) continue;
+        models[m] = {
+          train: ms.train.mean,
+          holdout: ms.holdout.mean,
+          train_ci: ms.train.ci_half_width ?? null,
+          holdout_ci: ms.holdout.ci_half_width ?? null,
+          train_n: ms.train.n,
+          holdout_n: ms.holdout.n,
+        };
+      }
+      return {
+        iteration: it.iteration,
+        models,
+        train: it.train.mean,
+        holdout: it.holdout.mean,
+        train_ci: it.train.ci_half_width ?? null,
+        holdout_ci: it.holdout.ci_half_width ?? null,
+        train_n: it.train.n,
+        holdout_n: it.holdout.n,
+      };
+    });
 }
 
-function buildGap(trajectory: TrajectoryPoint[]): GapPoint[] {
+function buildGap(trajectory: TrajectoryPoint[], targetModels: string[]): GapPoint[] {
   return trajectory
-    .filter((p): p is Required<TrajectoryPoint> & { train: number; holdout: number } =>
-      p.train != null && p.holdout != null,
-    )
-    .map((p) => ({ iteration: p.iteration, gap: p.train - p.holdout }));
+    .filter((p) => p.train != null && p.holdout != null)
+    .map((p) => {
+      const by_model: Record<string, number | null> = {};
+      for (const m of targetModels) {
+        const ms = p.models[m];
+        if (ms && ms.train != null && ms.holdout != null) {
+          by_model[m] = ms.train - ms.holdout;
+        } else {
+          by_model[m] = null;
+        }
+      }
+      return {
+        iteration: p.iteration,
+        gap: (p.train as number) - (p.holdout as number),
+        by_model,
+      };
+    });
 }
 
-function avg(arr: number[]): number {
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
+/**
+ * Lower-confidence-bound per model: argmax_iter (mean - 1.96 * SE).
+ * Returns model → best holdout mean for the iteration with the highest LCB.
+ * Prefers robust prompts over lucky high-variance ones.
+ */
+function bestHoldoutPerModel(stats: IterationStats | undefined): Record<string, number | null> {
+  if (!stats) return {};
+  const out: Record<string, number | null> = {};
+  for (const m of stats.target_models) {
+    let bestLcb: number | null = null;
+    let bestMean: number | null = null;
+    for (const it of stats.iterations) {
+      const ms = it.by_model[m];
+      if (!ms) continue;
+      const h = ms.holdout;
+      if (h.mean == null || h.n < 1) continue;
+      const se = h.se ?? 0;
+      const lcb = h.mean - 1.96 * se;
+      if (bestLcb == null || lcb > bestLcb) {
+        bestLcb = lcb;
+        bestMean = h.mean;
+      }
+    }
+    out[m] = bestMean;
+  }
+  return out;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-function _unused_runs(runs: Run[]) {
-  return runs;
+function bestHoldoutAggregated(stats: IterationStats | undefined): number | null {
+  if (!stats) return null;
+  let bestLcb: number | null = null;
+  let bestMean: number | null = null;
+  for (const it of stats.iterations) {
+    const h = it.holdout;
+    if (h.mean == null || h.n < 1) continue;
+    const se = h.se ?? 0;
+    const lcb = h.mean - 1.96 * se;
+    if (bestLcb == null || lcb > bestLcb) {
+      bestLcb = lcb;
+      bestMean = h.mean;
+    }
+  }
+  return bestMean;
+}
+
+function shortModel(model: string): string {
+  const lastSlash = model.lastIndexOf("/");
+  return lastSlash >= 0 ? model.slice(lastSlash + 1) : model;
 }
