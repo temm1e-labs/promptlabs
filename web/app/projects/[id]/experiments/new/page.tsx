@@ -51,13 +51,14 @@ export default function NewExperimentPage() {
   const max_iterations = preset ? preset.max_iterations : customMaxIter;
   const eval_size = preset ? preset.eval_size : customEvalSize;
 
-  const canSubmit =
-    name.trim() &&
-    intent.trim() &&
-    targets.length > 0 &&
-    objectives.length > 0 &&
-    labDefault.length > 0 &&
-    (mode === "cold" || existingPrompt.trim().length > 0);
+  const missing: string[] = [];
+  if (!name.trim()) missing.push("name");
+  if (!intent.trim()) missing.push("intent");
+  if (mode === "warm" && !existingPrompt.trim()) missing.push("existing prompt");
+  if (objectives.length === 0) missing.push("at least one objective");
+  if (targets.length === 0) missing.push("at least one target model");
+  if (!labDefault) missing.push("lab default model");
+  const canSubmit = missing.length === 0;
 
   const submit = async () => {
     if (!canSubmit) return;
@@ -129,7 +130,9 @@ export default function NewExperimentPage() {
 
         <Card className="p-6 space-y-4">
           <div className="space-y-1.5">
-            <Label htmlFor="exp-name">Experiment name</Label>
+            <Label htmlFor="exp-name">
+              Experiment name <RequiredMark />
+            </Label>
             <Input
               id="exp-name"
               value={name}
@@ -139,7 +142,9 @@ export default function NewExperimentPage() {
           </div>
 
           <div className="space-y-1.5">
-            <Label htmlFor="intent">2. Intent — what should the prompt do?</Label>
+            <Label htmlFor="intent">
+              2. Intent — what should the prompt do? <RequiredMark />
+            </Label>
             <Textarea
               id="intent"
               value={intent}
@@ -151,7 +156,9 @@ export default function NewExperimentPage() {
 
           {mode === "cold" ? (
             <div className="space-y-1.5">
-              <Label htmlFor="requirements">Requirements (optional)</Label>
+              <Label htmlFor="requirements">
+                Requirements <OptionalTag />
+              </Label>
               <Textarea
                 id="requirements"
                 value={requirements}
@@ -162,7 +169,9 @@ export default function NewExperimentPage() {
           ) : (
             <>
               <div className="space-y-1.5">
-                <Label htmlFor="existing">Existing prompt</Label>
+                <Label htmlFor="existing">
+                  Existing prompt <RequiredMark />
+                </Label>
                 <Textarea
                   id="existing"
                   value={existingPrompt}
@@ -172,31 +181,46 @@ export default function NewExperimentPage() {
                 />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="issues">What&apos;s wrong with it? (seeds the optimizer)</Label>
+                <Label htmlFor="issues">
+                  What&apos;s wrong with it? <OptionalTag />
+                </Label>
                 <Textarea
                   id="issues"
                   value={knownIssues}
                   onChange={(e) => setKnownIssues(e.target.value)}
                   placeholder="e.g. It hallucinates a category sometimes. Misclassifies multilingual inputs."
                 />
+                <p className="text-xs text-muted-foreground">
+                  Seeds the optimizer with failure modes to probe. Skip if you don&apos;t have
+                  specific complaints.
+                </p>
               </div>
             </>
           )}
         </Card>
 
         <Card className="p-6">
-          <Label className="mb-3 block">3. Optimize for</Label>
+          <Label className="mb-3 block">
+            3. Optimize for <RequiredMark />
+          </Label>
           <ObjectivePicker selected={objectives} onChange={setObjectives} />
         </Card>
 
         <Card className="p-6 space-y-5">
           <div>
-            <Label className="mb-3 block">4. Target models — what we test against</Label>
+            <Label className="mb-3 block">
+              4. Target models — what we test against <RequiredMark />
+            </Label>
             <ModelPicker selected={targets} onChange={setTargets} label="" />
           </div>
 
           <div className="border-t border-border pt-5">
-            <Label className="mb-3 block">5. Agent models — what drives the loop</Label>
+            <Label className="mb-3 block">
+              5. Agent models — what drives the loop <RequiredMark />
+            </Label>
+            <p className="mb-3 text-xs text-muted-foreground">
+              The lab default below is required; per-role overrides are optional.
+            </p>
             <AgentConfigPicker
               labDefault={labDefault}
               onLabDefault={setLabDefault}
@@ -207,7 +231,9 @@ export default function NewExperimentPage() {
         </Card>
 
         <Card className="p-6">
-          <Label className="mb-3 block">6. Run preset</Label>
+          <Label className="mb-3 block">
+            6. Run preset <OptionalTag />
+          </Label>
           <PresetPicker selectedId={presetId} onSelect={setPresetId} />
           {presetId === "custom" && (
             <div className="mt-4 grid gap-4 border-t border-border pt-4 md:grid-cols-3">
@@ -248,6 +274,23 @@ export default function NewExperimentPage() {
           )}
         </Card>
 
+        {!canSubmit && (
+          <div
+            className="rounded-md border border-[var(--score-bad)]/30 bg-[var(--score-bad)]/5 px-4 py-3 text-xs"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="font-medium text-[var(--score-bad)]">
+              Missing required field{missing.length === 1 ? "" : "s"}
+            </div>
+            <ul className="mt-1 list-disc pl-5 text-muted-foreground">
+              {missing.map((m) => (
+                <li key={m}>{m}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         <div className="flex items-center justify-between gap-3">
           <div className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
             <span>budget {budget_usd}$ · max {max_iterations} iter · {eval_size} items</span>
@@ -259,12 +302,40 @@ export default function NewExperimentPage() {
             <Button variant="ghost" onClick={() => router.back()}>
               Cancel
             </Button>
-            <Button onClick={submit} disabled={!canSubmit || mut.isPending}>
+            <Button
+              onClick={submit}
+              disabled={!canSubmit || mut.isPending}
+              title={
+                canSubmit
+                  ? undefined
+                  : `Missing: ${missing.join(", ")}`
+              }
+            >
               {mut.isPending ? "Starting..." : "Start loop"}
             </Button>
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+function RequiredMark() {
+  return (
+    <span
+      aria-label="required"
+      title="required"
+      className="ml-0.5 align-baseline text-[var(--score-bad)]"
+    >
+      *
+    </span>
+  );
+}
+
+function OptionalTag() {
+  return (
+    <span className="ml-1 align-baseline text-xs font-normal text-muted-foreground">
+      (optional)
+    </span>
   );
 }

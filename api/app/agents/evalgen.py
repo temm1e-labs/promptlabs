@@ -1,20 +1,38 @@
 """EvalGen agent — generates the rubric and eval items for an experiment.
 
-Inputs:
-  - task intent + prompt v0 (template with {{var}} placeholders)
-  - declared prompt variables
-  - optimization objectives (shapes the rubric weight + criterion selection)
-  - known_issues (warm-mode only — items probe these specifically)
-  - eval_size (target N) + train_ratio (default 0.7)
+Two execution paths, chosen by ``eval_size``:
 
-Outputs:
+  Path A — Single call (``eval_size <= SINGLE_CALL_MAX``):
+    One LLM call returns rubric + items. Fast and cheap for small eval sets;
+    a single LLM is reliably good at producing 10-15 diverse cases in one shot.
+
+  Path B — Batched (``eval_size > SINGLE_CALL_MAX``, default 15):
+    1. Taxonomy call: derive rubric + a stratification axis of 5-8 categories.
+    2. Parallel per-category batches: one LLM call per category, fired
+       concurrently via ``asyncio.gather``. Each batch only has to produce
+       ``ceil(eval_size / n_categories)`` items — far inside the "reliable
+       structured-output" envelope of a single call.
+    3. Text-hash dedup: normalize input text and drop verbatim duplicates.
+    4. Optional top-up: if the dedup'd pool is short, one more call fills
+       the gap with explicit avoid-list of existing labels.
+
+  Why batched: a single call asked for 40-50+ items tends to truncate the
+  tail JSON, repeat themes, or produce shallow variations. Batches of ~8
+  cases stay inside the structured-output envelope, and stratification by
+  taxonomy makes duplication across batches structurally unlikely.
+
+Outputs (both paths):
   - rubric: 3-6 criteria, each tied to an objective when possible
   - items: N input_vars dicts with optional expected_output + label + tags
-  - deterministic 70/30 train/holdout split (index-based on item order)
+  - shuffled, deterministic train/holdout split (seeded per experiment)
 """
 
 from __future__ import annotations
 
+import asyncio
+import math
+import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +41,16 @@ from pydantic import BaseModel, Field
 from app.core import providers
 from app.core.logging import log
 from app.schemas.common import PromptVariable, RubricCriterion
+
+SINGLE_CALL_MAX = 15  # eval_size at or below this stays on the single-call path
+ITEMS_PER_BATCH = 8  # target items per per-category batch on the batched path
+MIN_CATEGORIES = 5
+MAX_CATEGORIES = 8
+
+ProgressCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+# ─── schemas ─────────────────────────────────────────────────────────────
 
 
 class GeneratedEvalItem(BaseModel):
@@ -58,12 +86,66 @@ class GeneratedEvalItem(BaseModel):
 
 
 class EvalGenOutput(BaseModel):
+    """Single-call path schema: rubric + items in one shot."""
+
     rubric: list[RubricCriterion] = Field(
         description="3-6 criteria that scoring will use. Each tied to an objective when possible."
     )
     items: list[GeneratedEvalItem] = Field(
         description="Test cases. Mix common, edge, and adversarial inputs."
     )
+
+
+class EvalCategory(BaseModel):
+    name: str = Field(
+        description=(
+            "Short kebab-case identifier for this category (e.g. 'billing-clear', "
+            "'edge-multilingual', 'adversarial-prompt-injection')."
+        )
+    )
+    description: str = Field(
+        description=(
+            "One or two sentences describing what makes inputs in this category distinct "
+            "and what aspect of the prompt they probe."
+        )
+    )
+    target_tag: str = Field(
+        description=(
+            "One of: 'common' (happy path), 'edge' (unusual but legitimate), "
+            "'adversarial' (attempts to break the prompt)."
+        )
+    )
+    target_count: int = Field(
+        ge=1,
+        description="How many test cases should be drawn from this category.",
+    )
+
+
+class TaxonomyOutput(BaseModel):
+    """Batched-path step 1: rubric + stratification axis."""
+
+    rubric: list[RubricCriterion] = Field(
+        description="3-6 criteria that scoring will use. Each tied to an objective when possible."
+    )
+    categories: list[EvalCategory] = Field(
+        description=(
+            f"{MIN_CATEGORIES}-{MAX_CATEGORIES} categories that partition the input space. "
+            "Together they should cover common, edge, and adversarial inputs in proportion "
+            "~60% common / ~25% edge / ~15% adversarial."
+        ),
+    )
+
+
+class CategoryBatchOutput(BaseModel):
+    """Batched-path step 2: items for one category."""
+
+    items: list[GeneratedEvalItem]
+
+
+class TopupOutput(BaseModel):
+    """Batched-path step 4: extra items to fill gap after dedup."""
+
+    items: list[GeneratedEvalItem]
 
 
 @dataclass
@@ -73,6 +155,9 @@ class EvalGenResult:
     holdout_items: list[GeneratedEvalItem]
     cost_usd: float
     cache_hit: bool
+
+
+# ─── prompt construction ─────────────────────────────────────────────────
 
 
 _OBJECTIVE_TO_CRITERIA_HINT = {
@@ -98,7 +183,7 @@ _OBJECTIVE_TO_CRITERIA_HINT = {
 }
 
 
-_SYSTEM = """You are designing an evaluation harness for a prompt that is being iteratively
+_SYSTEM_SINGLE = """You are designing an evaluation harness for a prompt that is being iteratively
 optimized. Your output drives both rubric scoring and test-case selection.
 
 Hard rules:
@@ -121,6 +206,41 @@ Hard rules:
 6. Output strict JSON matching the schema."""
 
 
+_SYSTEM_TAXONOMY = """You are designing the stratification axis for an evaluation harness.
+Given a prompt and its intent, you produce TWO things:
+
+1. A rubric of 3-6 criteria that scoring will use (with weights and definitions).
+2. A taxonomy of input categories that partition the test-case space.
+
+The categories will each be expanded by a separate LLM call. Your job is to define them
+clearly enough that those downstream calls produce diverse, non-overlapping items.
+
+Hard rules:
+1. Categories must be DISJOINT — an input should belong to one category, not multiple.
+2. Categories must be CONCRETE — "edge cases" is too vague; "non-English inputs" or
+   "single-token inputs" is concrete.
+3. Use proportions ~60% common / ~25% edge / ~15% adversarial (set `target_count` per
+   category so they sum to approximately the requested total).
+4. Rubric criteria must be JUDGEABLE FROM TEXT ALONE (no runtime metrics).
+5. When a criterion maps to a known optimization objective, set its `objective` field.
+6. Output strict JSON."""
+
+
+_SYSTEM_BATCH = """You are generating test cases for ONE category of an evaluation harness.
+A separate process has already chosen the rubric and the category boundaries. Your job is
+to produce diverse, realistic items WITHIN this single category.
+
+Hard rules:
+1. Every item's TEST INPUT must be populated via `input_text` (single-variable prompts)
+   or `input_vars` (multi-variable prompts). NEVER leave both empty.
+2. All items in your output must clearly belong to the assigned category — do NOT bleed
+   into adjacent categories.
+3. Items must be DIVERSE within the category. Don't produce N rewordings of the same idea.
+4. Provide `expected_output` ONLY for tasks with objective ground truth. Otherwise null.
+5. Tag each item with the category's tag plus optional sub-tags.
+6. Output strict JSON."""
+
+
 def _objectives_section(objectives: list[str]) -> str:
     lines = []
     for obj in objectives:
@@ -130,28 +250,14 @@ def _objectives_section(objectives: list[str]) -> str:
     return "\n".join(lines) or "- accuracy: include a 'correctness' criterion."
 
 
-def _build_user_message(
-    *,
-    intent: str,
-    prompt_v0: str,
-    variables: list[PromptVariable],
-    objectives: list[str],
-    known_issues: str | None,
-    eval_size: int,
-) -> str:
-    declared_keys = [v.name for v in variables]
-    vars_block = (
-        "\n".join(
-            f"  - {v.name}: {v.description} (example: {v.example_value!r})" for v in variables
-        )
-        or "  (no variables declared)"
-    )
-
+def _which_field_block(declared_keys: list[str]) -> tuple[str, str]:
+    """Return (which_field_instruction, example_item_json) given declared vars."""
     if len(declared_keys) <= 1:
         which_field = (
             f"Use `input_text` (a SINGLE STRING) — it will be substituted into "
-            f"{{{{{declared_keys[0]}}}}} if declared." if declared_keys else
-            "Use `input_text` (a SINGLE STRING) — there are no declared variables."
+            f"{{{{{declared_keys[0]}}}}} if declared."
+            if declared_keys
+            else "Use `input_text` (a SINGLE STRING) — there are no declared variables."
         )
         example_item = (
             "{\n"
@@ -168,9 +274,7 @@ def _build_user_message(
             f"Use `input_vars` — the prompt has {len(declared_keys)} variables: {keys_csv}. "
             f"Every test case's input_vars MUST contain ALL of these keys."
         )
-        example_input_vars = (
-            "{" + ", ".join(f'"{k}": "...value..."' for k in declared_keys) + "}"
-        )
+        example_input_vars = "{" + ", ".join(f'"{k}": "...value..."' for k in declared_keys) + "}"
         example_item = (
             "{\n"
             '  "label": "Realistic case name",\n'
@@ -180,7 +284,26 @@ def _build_user_message(
             '  "tags": ["common"]\n'
             "}"
         )
+    return which_field, example_item
 
+
+def _build_user_single(
+    *,
+    intent: str,
+    prompt_v0: str,
+    variables: list[PromptVariable],
+    objectives: list[str],
+    known_issues: str | None,
+    eval_size: int,
+) -> str:
+    declared_keys = [v.name for v in variables]
+    vars_block = (
+        "\n".join(
+            f"  - {v.name}: {v.description} (example: {v.example_value!r})" for v in variables
+        )
+        or "  (no variables declared)"
+    )
+    which_field, example_item = _which_field_block(declared_keys)
     issues_block = (
         f"\nUser-reported failure modes (write items that probe these):\n{known_issues}\n"
         if known_issues
@@ -200,6 +323,112 @@ def _build_user_message(
     )
 
 
+def _build_user_taxonomy(
+    *,
+    intent: str,
+    prompt_v0: str,
+    variables: list[PromptVariable],
+    objectives: list[str],
+    known_issues: str | None,
+    eval_size: int,
+) -> str:
+    declared_keys = [v.name for v in variables]
+    vars_block = (
+        "\n".join(
+            f"  - {v.name}: {v.description} (example: {v.example_value!r})" for v in variables
+        )
+        or "  (no variables declared)"
+    )
+    issues_block = (
+        f"\nUser-reported failure modes (carve out at least one category that probes these):\n"
+        f"{known_issues}\n"
+        if known_issues
+        else ""
+    )
+
+    return (
+        f"Task intent:\n{intent}\n\n"
+        f'Prompt template (v0):\n"""\n{prompt_v0}\n"""\n\n'
+        f"Declared variables:\n{vars_block}\n\n"
+        f"Optimization objectives → rubric guidance:\n{_objectives_section(objectives)}\n"
+        f"{issues_block}\n"
+        f"Design {MIN_CATEGORIES}-{MAX_CATEGORIES} input categories that, between them, will "
+        f"yield approximately {eval_size} test cases total. Sum of target_count fields should "
+        f"be approximately {eval_size}.\n\n"
+        "Output strict JSON with both `rubric` and `categories`."
+    )
+
+
+def _build_user_batch(
+    *,
+    intent: str,
+    prompt_v0: str,
+    variables: list[PromptVariable],
+    category: EvalCategory,
+    rubric_summary: str,
+) -> str:
+    declared_keys = [v.name for v in variables]
+    vars_block = (
+        "\n".join(
+            f"  - {v.name}: {v.description} (example: {v.example_value!r})" for v in variables
+        )
+        or "  (no variables declared)"
+    )
+    which_field, example_item = _which_field_block(declared_keys)
+
+    return (
+        f"Task intent:\n{intent}\n\n"
+        f'Prompt template (v0):\n"""\n{prompt_v0}\n"""\n\n'
+        f"Declared variables:\n{vars_block}\n\n"
+        f"How to populate the test input for each case:\n  {which_field}\n\n"
+        f"Concrete example for ONE item:\n{example_item}\n\n"
+        f"Rubric criteria the prompt will be scored against:\n{rubric_summary}\n\n"
+        f"Category you must generate:\n"
+        f"  name: {category.name}\n"
+        f"  description: {category.description}\n"
+        f"  target tag: {category.target_tag}\n\n"
+        f"Generate exactly {category.target_count} items that belong to THIS category. "
+        f"Do not produce items that would fit better in a different category. Be diverse "
+        f"within the category.\nOutput strict JSON."
+    )
+
+
+def _build_user_topup(
+    *,
+    intent: str,
+    prompt_v0: str,
+    variables: list[PromptVariable],
+    n_needed: int,
+    existing_labels: list[str],
+    rubric_summary: str,
+) -> str:
+    declared_keys = [v.name for v in variables]
+    vars_block = (
+        "\n".join(
+            f"  - {v.name}: {v.description} (example: {v.example_value!r})" for v in variables
+        )
+        or "  (no variables declared)"
+    )
+    which_field, example_item = _which_field_block(declared_keys)
+    avoid_block = "\n".join(f"  - {label}" for label in existing_labels[:60])
+
+    return (
+        f"Task intent:\n{intent}\n\n"
+        f'Prompt template (v0):\n"""\n{prompt_v0}\n"""\n\n'
+        f"Declared variables:\n{vars_block}\n\n"
+        f"How to populate the test input for each case:\n  {which_field}\n\n"
+        f"Concrete example for ONE item:\n{example_item}\n\n"
+        f"Rubric criteria the prompt will be scored against:\n{rubric_summary}\n\n"
+        f"Test cases ALREADY GENERATED (do NOT produce near-duplicates):\n{avoid_block}\n\n"
+        f"Generate exactly {n_needed} additional test cases that are distinct in BOTH input "
+        f"text and the failure mode they probe. Prefer edge and adversarial cases.\n"
+        "Output strict JSON."
+    )
+
+
+# ─── reconciliation + dedup ──────────────────────────────────────────────
+
+
 def _reconcile_item(
     item: GeneratedEvalItem,
     declared_keys: list[str],
@@ -216,25 +445,20 @@ def _reconcile_item(
     declared = set(declared_keys)
     item_vars = item.input_vars or {}
 
-    # (1) exact match
     if item_vars and set(item_vars.keys()) == declared:
         return dict(item_vars)
 
-    # (2) case-insensitive
     if item_vars:
         lower_to_actual = {k.lower(): k for k in item_vars}
         if {k.lower() for k in declared_keys} == set(lower_to_actual.keys()):
             return {dk: item_vars[lower_to_actual[dk.lower()]] for dk in declared_keys}
 
-    # (3) positional
     if item_vars and len(item_vars) == len(declared_keys) and len(declared_keys) >= 1:
         item_keys = list(item_vars.keys())
         return {declared_keys[i]: item_vars[item_keys[i]] for i in range(len(declared_keys))}
 
-    # (4) fall back to flat input_text → first declared var
     if item.input_text and len(declared_keys) >= 1:
         result = {declared_keys[0]: item.input_text}
-        # Optionally fill remaining vars from input_vars if some keys overlap
         for k in declared_keys[1:]:
             if k in item_vars:
                 result[k] = item_vars[k]
@@ -267,6 +491,43 @@ def _filter_items(
     return kept
 
 
+_WS_RUN = re.compile(r"\s+")
+
+
+def _normalize_for_dedup(item: GeneratedEvalItem) -> str:
+    """Build a canonical string for duplicate detection.
+
+    Hashes the lowercased, whitespace-collapsed concatenation of input_vars
+    (in sorted-key order). Two items collide iff their normalized inputs are
+    identical — catches verbatim duplicates and trivial whitespace variants
+    without needing embedding infrastructure.
+    """
+    parts: list[str] = []
+    for k in sorted(item.input_vars.keys()):
+        v = item.input_vars[k] or ""
+        parts.append(f"{k}={v}")
+    blob = "||".join(parts).lower()
+    return _WS_RUN.sub(" ", blob).strip()
+
+
+def _dedup_items(items: list[GeneratedEvalItem]) -> list[GeneratedEvalItem]:
+    """Drop items whose normalized form matches an earlier item's."""
+    seen: set[str] = set()
+    kept: list[GeneratedEvalItem] = []
+    for item in items:
+        key = _normalize_for_dedup(item)
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(item)
+    return kept
+
+
+# ─── split ───────────────────────────────────────────────────────────────
+
+
 def _split(
     items: list[GeneratedEvalItem],
     train_ratio: float,
@@ -281,10 +542,11 @@ def _split(
     with a deterministic seed removes that bias while keeping the split
     reproducible per experiment.
     """
-    import math
     import random
 
     n = len(items)
+    if n == 0:
+        return [], []
     n_train = max(1, math.ceil(n * train_ratio))
     n_train = min(n_train, n - 1) if n > 1 else n_train
 
@@ -296,7 +558,10 @@ def _split(
     return train, holdout
 
 
-async def generate(
+# ─── single-call path ────────────────────────────────────────────────────
+
+
+async def _generate_single(
     *,
     intent: str,
     prompt_v0: str,
@@ -306,9 +571,10 @@ async def generate(
     eval_size: int,
     train_ratio: float,
     model: str,
-    split_seed: int = 0,
+    split_seed: int,
+    declared_var_names: list[str],
 ) -> EvalGenResult:
-    user_msg = _build_user_message(
+    user_msg = _build_user_single(
         intent=intent,
         prompt_v0=prompt_v0,
         variables=variables,
@@ -316,42 +582,25 @@ async def generate(
         known_issues=known_issues,
         eval_size=eval_size,
     )
-
-    declared_var_names = [v.name for v in variables]
-    if not declared_var_names:
-        # No variables in the prompt — auto-add an `input` slot so eval items can vary
-        log.info("evalgen.no_variables_synthesizing_input_slot")
-        declared_var_names = ["input"]
-
     result = await providers.complete(
         model=model,
         messages=[
-            {"role": "system", "content": _SYSTEM},
+            {"role": "system", "content": _SYSTEM_SINGLE},
             {"role": "user", "content": user_msg},
         ],
         response_format=EvalGenOutput,
         temperature=0.7,
     )
-
     if isinstance(result.parsed, EvalGenOutput):
-        log.info(
-            "evalgen.parsed",
-            n_rubric=len(result.parsed.rubric),
-            n_items=len(result.parsed.items),
-            declared_keys=declared_var_names,
-        )
         rubric = result.parsed.rubric
-        items = _filter_items(result.parsed.items, declared_var_names)
-        if len(items) < len(result.parsed.items):
+        items_raw = result.parsed.items
+        items = _filter_items(items_raw, declared_var_names)
+        items = _dedup_items(items)
+        if len(items) < len(items_raw):
             log.warning(
                 "evalgen.items_filtered",
-                before=len(result.parsed.items),
+                before=len(items_raw),
                 after=len(items),
-                first_item_keys=(
-                    list(result.parsed.items[0].input_vars.keys())
-                    if result.parsed.items
-                    else []
-                ),
             )
     else:
         log.warning(
@@ -361,7 +610,9 @@ async def generate(
         rubric = [
             RubricCriterion(
                 name="correctness",
-                definition="The output correctly accomplishes the task as described in the intent.",
+                definition=(
+                    "The output correctly accomplishes the task as described in the intent."
+                ),
                 weight=1.0,
                 objective="accuracy",
             )
@@ -375,6 +626,366 @@ async def generate(
         holdout_items=holdout,
         cost_usd=result.cost_usd,
         cache_hit=result.cache_hit,
+    )
+
+
+# ─── batched path ────────────────────────────────────────────────────────
+
+
+def _rubric_summary(rubric: list[RubricCriterion]) -> str:
+    return "\n".join(f"  - {c.name} (weight {c.weight}): {c.definition}" for c in rubric)
+
+
+def _normalize_categories(
+    categories: list[EvalCategory],
+    eval_size: int,
+) -> list[EvalCategory]:
+    """Clamp category count and rebalance target_counts to ~eval_size total."""
+    if not categories:
+        return []
+    if len(categories) > MAX_CATEGORIES:
+        categories = categories[:MAX_CATEGORIES]
+
+    total = sum(c.target_count for c in categories)
+    if total <= 0:
+        per_cat = max(1, math.ceil(eval_size / len(categories)))
+        return [c.model_copy(update={"target_count": per_cat}) for c in categories]
+
+    # Rescale so the sum is approximately eval_size, with a generous buffer
+    # (over-generate ~15% to absorb dedup losses).
+    target_total = max(eval_size, int(math.ceil(eval_size * 1.15)))
+    scale = target_total / total
+    rescaled: list[EvalCategory] = []
+    for c in categories:
+        new_count = max(1, int(round(c.target_count * scale)))
+        rescaled.append(c.model_copy(update={"target_count": new_count}))
+    return rescaled
+
+
+async def _generate_taxonomy(
+    *,
+    intent: str,
+    prompt_v0: str,
+    variables: list[PromptVariable],
+    objectives: list[str],
+    known_issues: str | None,
+    eval_size: int,
+    model: str,
+) -> tuple[TaxonomyOutput | None, float, bool]:
+    user_msg = _build_user_taxonomy(
+        intent=intent,
+        prompt_v0=prompt_v0,
+        variables=variables,
+        objectives=objectives,
+        known_issues=known_issues,
+        eval_size=eval_size,
+    )
+    result = await providers.complete(
+        model=model,
+        messages=[
+            {"role": "system", "content": _SYSTEM_TAXONOMY},
+            {"role": "user", "content": user_msg},
+        ],
+        response_format=TaxonomyOutput,
+        temperature=0.5,
+    )
+    parsed = result.parsed if isinstance(result.parsed, TaxonomyOutput) else None
+    return parsed, result.cost_usd, result.cache_hit
+
+
+async def _generate_category_batch(
+    *,
+    intent: str,
+    prompt_v0: str,
+    variables: list[PromptVariable],
+    category: EvalCategory,
+    rubric_summary: str,
+    model: str,
+) -> tuple[list[GeneratedEvalItem], float, bool]:
+    user_msg = _build_user_batch(
+        intent=intent,
+        prompt_v0=prompt_v0,
+        variables=variables,
+        category=category,
+        rubric_summary=rubric_summary,
+    )
+    try:
+        result = await providers.complete(
+            model=model,
+            messages=[
+                {"role": "system", "content": _SYSTEM_BATCH},
+                {"role": "user", "content": user_msg},
+            ],
+            response_format=CategoryBatchOutput,
+            temperature=0.7,
+        )
+    except Exception as exc:  # one failed batch should not poison the whole run
+        log.warning(
+            "evalgen.batch_failed",
+            category=category.name,
+            error=str(exc)[:200],
+        )
+        return [], 0.0, False
+    if isinstance(result.parsed, CategoryBatchOutput):
+        # Apply the category's tag so downstream stratification stays visible
+        items = [
+            item.model_copy(
+                update={
+                    "tags": list(dict.fromkeys([*item.tags, category.target_tag, category.name]))
+                }
+            )
+            for item in result.parsed.items
+        ]
+        return items, result.cost_usd, result.cache_hit
+    log.warning(
+        "evalgen.batch_parse_failed",
+        category=category.name,
+        content_preview=result.content[:200],
+    )
+    return [], result.cost_usd, result.cache_hit
+
+
+async def _generate_topup(
+    *,
+    intent: str,
+    prompt_v0: str,
+    variables: list[PromptVariable],
+    n_needed: int,
+    existing_labels: list[str],
+    rubric_summary: str,
+    model: str,
+) -> tuple[list[GeneratedEvalItem], float, bool]:
+    user_msg = _build_user_topup(
+        intent=intent,
+        prompt_v0=prompt_v0,
+        variables=variables,
+        n_needed=n_needed,
+        existing_labels=existing_labels,
+        rubric_summary=rubric_summary,
+    )
+    try:
+        result = await providers.complete(
+            model=model,
+            messages=[
+                {"role": "system", "content": _SYSTEM_BATCH},
+                {"role": "user", "content": user_msg},
+            ],
+            response_format=TopupOutput,
+            temperature=0.8,
+        )
+    except Exception as exc:
+        log.warning("evalgen.topup_failed", error=str(exc)[:200])
+        return [], 0.0, False
+    if isinstance(result.parsed, TopupOutput):
+        return list(result.parsed.items), result.cost_usd, result.cache_hit
+    return [], result.cost_usd, result.cache_hit
+
+
+async def _emit(
+    on_progress: ProgressCallback | None,
+    event_type: str,
+    **data: Any,
+) -> None:
+    if on_progress is None:
+        return
+    try:
+        await on_progress(event_type, data)
+    except Exception as exc:
+        log.warning("evalgen.progress_callback_failed", error=str(exc)[:120])
+
+
+async def _generate_batched(
+    *,
+    intent: str,
+    prompt_v0: str,
+    variables: list[PromptVariable],
+    objectives: list[str],
+    known_issues: str | None,
+    eval_size: int,
+    train_ratio: float,
+    model: str,
+    split_seed: int,
+    declared_var_names: list[str],
+    on_progress: ProgressCallback | None,
+) -> EvalGenResult:
+    # 1. Taxonomy
+    taxonomy, taxo_cost, taxo_cache = await _generate_taxonomy(
+        intent=intent,
+        prompt_v0=prompt_v0,
+        variables=variables,
+        objectives=objectives,
+        known_issues=known_issues,
+        eval_size=eval_size,
+        model=model,
+    )
+    total_cost = taxo_cost
+    any_cache_hit = taxo_cache
+
+    if taxonomy is None or not taxonomy.categories:
+        log.warning(
+            "evalgen.taxonomy_failed_falling_back_to_single_call",
+            eval_size=eval_size,
+        )
+        # Fall back to single-call path for resilience — small extra cost vs failing
+        return await _generate_single(
+            intent=intent,
+            prompt_v0=prompt_v0,
+            variables=variables,
+            objectives=objectives,
+            known_issues=known_issues,
+            eval_size=eval_size,
+            train_ratio=train_ratio,
+            model=model,
+            split_seed=split_seed,
+            declared_var_names=declared_var_names,
+        )
+
+    rubric = taxonomy.rubric
+    categories = _normalize_categories(taxonomy.categories, eval_size)
+    rubric_summary = _rubric_summary(rubric)
+
+    await _emit(
+        on_progress,
+        "evalgen.taxonomy_completed",
+        n_categories=len(categories),
+        categories=[{"name": c.name, "target_count": c.target_count} for c in categories],
+        cost_usd=taxo_cost,
+    )
+
+    # 2. Parallel per-category batches
+    batch_results = await asyncio.gather(
+        *[
+            _generate_category_batch(
+                intent=intent,
+                prompt_v0=prompt_v0,
+                variables=variables,
+                category=cat,
+                rubric_summary=rubric_summary,
+                model=model,
+            )
+            for cat in categories
+        ]
+    )
+
+    all_items: list[GeneratedEvalItem] = []
+    for cat, (items, cost, cache_hit) in zip(categories, batch_results, strict=True):
+        total_cost += cost
+        any_cache_hit = any_cache_hit or cache_hit
+        all_items.extend(items)
+        await _emit(
+            on_progress,
+            "evalgen.batch_completed",
+            category=cat.name,
+            target_count=cat.target_count,
+            actual_count=len(items),
+            cost_usd=cost,
+        )
+
+    # 3. Reconcile + dedup
+    filtered = _filter_items(all_items, declared_var_names)
+    deduped = _dedup_items(filtered)
+    log.info(
+        "evalgen.batched_pool",
+        raw=len(all_items),
+        after_filter=len(filtered),
+        after_dedup=len(deduped),
+        target=eval_size,
+    )
+
+    # 4. Top-up if short
+    if len(deduped) < eval_size:
+        gap = eval_size - len(deduped)
+        topup_items, topup_cost, topup_cache = await _generate_topup(
+            intent=intent,
+            prompt_v0=prompt_v0,
+            variables=variables,
+            n_needed=gap,
+            existing_labels=[item.label for item in deduped],
+            rubric_summary=rubric_summary,
+            model=model,
+        )
+        total_cost += topup_cost
+        any_cache_hit = any_cache_hit or topup_cache
+        topup_filtered = _filter_items(topup_items, declared_var_names)
+        before = len(deduped)
+        combined = _dedup_items([*deduped, *topup_filtered])
+        deduped = combined
+        await _emit(
+            on_progress,
+            "evalgen.topup_completed",
+            requested=gap,
+            added=len(deduped) - before,
+            cost_usd=topup_cost,
+        )
+
+    # 5. Trim to target + split
+    final_items = deduped[:eval_size]
+    train, holdout = _split(final_items, train_ratio, seed=split_seed)
+    return EvalGenResult(
+        rubric=rubric,
+        train_items=train,
+        holdout_items=holdout,
+        cost_usd=total_cost,
+        cache_hit=any_cache_hit,
+    )
+
+
+# ─── public entry point ──────────────────────────────────────────────────
+
+
+async def generate(
+    *,
+    intent: str,
+    prompt_v0: str,
+    variables: list[PromptVariable],
+    objectives: list[str],
+    known_issues: str | None,
+    eval_size: int,
+    train_ratio: float,
+    model: str,
+    split_seed: int = 0,
+    on_progress: ProgressCallback | None = None,
+) -> EvalGenResult:
+    """Generate the eval set.
+
+    Dispatches to the single-call path for small eval sets and the batched
+    taxonomy+parallel path for larger ones. ``on_progress`` (if provided)
+    is invoked with ``(event_type, data_dict)`` at each batched-path
+    milestone so the orchestrator can stream SSE events to the UI.
+    """
+    declared_var_names = [v.name for v in variables]
+    if not declared_var_names:
+        log.info("evalgen.no_variables_synthesizing_input_slot")
+        declared_var_names = ["input"]
+
+    if eval_size <= SINGLE_CALL_MAX:
+        log.info("evalgen.path_single", eval_size=eval_size)
+        return await _generate_single(
+            intent=intent,
+            prompt_v0=prompt_v0,
+            variables=variables,
+            objectives=objectives,
+            known_issues=known_issues,
+            eval_size=eval_size,
+            train_ratio=train_ratio,
+            model=model,
+            split_seed=split_seed,
+            declared_var_names=declared_var_names,
+        )
+
+    log.info("evalgen.path_batched", eval_size=eval_size)
+    return await _generate_batched(
+        intent=intent,
+        prompt_v0=prompt_v0,
+        variables=variables,
+        objectives=objectives,
+        known_issues=known_issues,
+        eval_size=eval_size,
+        train_ratio=train_ratio,
+        model=model,
+        split_seed=split_seed,
+        declared_var_names=declared_var_names,
+        on_progress=on_progress,
     )
 
 

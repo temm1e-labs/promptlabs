@@ -246,6 +246,17 @@ async def _execute_on_split(
         max_concurrency=settings.max_concurrent_requests,
     )
 
+    await _emit(
+        experiment.id,
+        "judge.started",
+        run_id=run.id,
+        target_model=target_model,
+        split=split.value,
+        iteration=iteration,
+        n_items=len(items),
+        judge_model=judge_model,
+    )
+
     item_by_id = {item.id: item for item in items}
     scored = await asyncio.gather(
         *[
@@ -472,6 +483,12 @@ async def run_experiment(
 
             # ── Phase 1: Writer ────────────────────────────────────────
             writer_model = _agent_model(experiment, "writer")
+            await _emit(
+                experiment_id,
+                "writer.started",
+                model=writer_model,
+                mode=mode,
+            )
             if mode == "warm":
                 writer_result = await writer_agent.write_warm(
                     existing_prompt=existing_prompt or "",
@@ -531,6 +548,22 @@ async def run_experiment(
             split_seed = int(
                 hashlib.sha256(experiment_id.encode()).hexdigest()[:8], 16
             )
+            await _emit(
+                experiment_id,
+                "evalgen.started",
+                model=evalgen_model,
+                eval_size=experiment.eval_size,
+                train_ratio=experiment.train_ratio,
+                mode=(
+                    "batched"
+                    if experiment.eval_size > evalgen_agent.SINGLE_CALL_MAX
+                    else "single"
+                ),
+            )
+
+            async def _evalgen_progress(event_type: str, data: dict[str, Any]) -> None:
+                await _emit(experiment_id, event_type, **data)
+
             evalgen_result = await evalgen_agent.generate(
                 intent=experiment.intent,
                 prompt_v0=writer_result.output.prompt,
@@ -541,6 +574,7 @@ async def run_experiment(
                 train_ratio=experiment.train_ratio,
                 model=evalgen_model,
                 split_seed=split_seed,
+                on_progress=_evalgen_progress,
             )
             ok = await _accumulate_cost(db, experiment, evalgen_result.cost_usd)
             rubric_dicts = [c.model_dump() for c in evalgen_result.rubric]
@@ -615,33 +649,44 @@ async def run_experiment(
                 await db.commit()
                 await _emit(experiment_id, "iteration.started", iteration=iteration)
 
-                # 3a. Train pass
-                iter_train_scores: list[float] = []
-                for target_model in experiment.target_models:
-                    _run, mean = await _execute_on_split(
-                        db,
-                        experiment,
-                        prompt_version=current_prompt_version,
-                        target_model=target_model,
-                        items=train_items,
-                        iteration=iteration,
-                        split=Split.TRAIN,
-                        rubric=rubric_dicts,
-                        judge_model=judge_model,
-                    )
-                    iter_train_scores.append(mean)
-                    ok = await _accumulate_cost(db, experiment, _run.cost_usd)
-                    if not ok:
-                        await _set_status(
-                            db, experiment, ExperimentStatus.EXHAUSTED, "budget during train pass"
+                # 3a. Train pass — parallel fan-out across target models
+                train_results = await asyncio.gather(
+                    *[
+                        _execute_on_split(
+                            db,
+                            experiment,
+                            prompt_version=current_prompt_version,
+                            target_model=target_model,
+                            items=train_items,
+                            iteration=iteration,
+                            split=Split.TRAIN,
+                            rubric=rubric_dicts,
+                            judge_model=judge_model,
                         )
-                        await _emit(experiment_id, "loop.finished", status=experiment.status.value)
-                        return
+                        for target_model in experiment.target_models
+                    ]
+                )
+                iter_train_scores = [mean for _run, mean in train_results]
+                for _run, _ in train_results:
+                    ok = await _accumulate_cost(db, experiment, _run.cost_usd)
+                if not ok:
+                    await _set_status(
+                        db, experiment, ExperimentStatus.EXHAUSTED, "budget during train pass"
+                    )
+                    await _emit(experiment_id, "loop.finished", status=experiment.status.value)
+                    return
                 train_mean_iter = statistics.fmean(iter_train_scores) if iter_train_scores else 0.0
                 train_means.append(train_mean_iter)
 
                 # 3b. Optimize
                 samples = await _failure_samples_for_optimizer(db, experiment_id, iteration)
+                await _emit(
+                    experiment_id,
+                    "optimizer.started",
+                    iteration=iteration,
+                    model=optimizer_model,
+                    n_failure_samples=len(samples),
+                )
                 opt_result = await optimizer_agent.optimize(
                     current_prompt=current_prompt_version.content,
                     iteration=iteration,
@@ -696,28 +741,32 @@ async def run_experiment(
                     await _emit(experiment_id, "loop.finished", status=experiment.status.value)
                     return
 
-                # 3c. Holdout pass on the new version
-                iter_holdout_scores: list[float] = []
-                for target_model in experiment.target_models:
-                    _run, mean = await _execute_on_split(
-                        db,
-                        experiment,
-                        prompt_version=new_version,
-                        target_model=target_model,
-                        items=holdout_items,
-                        iteration=iteration,
-                        split=Split.HOLDOUT,
-                        rubric=rubric_dicts,
-                        judge_model=judge_model,
-                    )
-                    iter_holdout_scores.append(mean)
-                    ok = await _accumulate_cost(db, experiment, _run.cost_usd)
-                    if not ok:
-                        await _set_status(
-                            db, experiment, ExperimentStatus.EXHAUSTED, "budget during holdout"
+                # 3c. Holdout pass on the new version — parallel fan-out
+                holdout_results = await asyncio.gather(
+                    *[
+                        _execute_on_split(
+                            db,
+                            experiment,
+                            prompt_version=new_version,
+                            target_model=target_model,
+                            items=holdout_items,
+                            iteration=iteration,
+                            split=Split.HOLDOUT,
+                            rubric=rubric_dicts,
+                            judge_model=judge_model,
                         )
-                        await _emit(experiment_id, "loop.finished", status=experiment.status.value)
-                        return
+                        for target_model in experiment.target_models
+                    ]
+                )
+                iter_holdout_scores = [mean for _run, mean in holdout_results]
+                for _run, _ in holdout_results:
+                    ok = await _accumulate_cost(db, experiment, _run.cost_usd)
+                if not ok:
+                    await _set_status(
+                        db, experiment, ExperimentStatus.EXHAUSTED, "budget during holdout"
+                    )
+                    await _emit(experiment_id, "loop.finished", status=experiment.status.value)
+                    return
                 holdout_mean_iter = (
                     statistics.fmean(iter_holdout_scores) if iter_holdout_scores else 0.0
                 )

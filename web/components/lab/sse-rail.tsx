@@ -14,13 +14,20 @@ const ICON: Record<string, string> = {
   "loop.started": "▶",
   "loop.finished": "■",
   "loop.failed": "!",
+  "writer.started": "◌",
   "writer.completed": "✎",
   "writer.auto_wrapped": "⮊",
+  "evalgen.started": "◌",
+  "evalgen.taxonomy_completed": "⊞",
+  "evalgen.batch_completed": "•",
+  "evalgen.topup_completed": "+",
   "evalgen.completed": "𝛴",
   "iteration.started": "→",
   "iteration.completed": "✓",
   "run.started": "▸",
   "run.completed": "▪",
+  "judge.started": "◌",
+  "optimizer.started": "◌",
   "optimizer.completed": "Δ",
   "optimizer.noop": "·",
 };
@@ -30,13 +37,20 @@ const TRACKED_EVENTS = [
   "loop.started",
   "loop.finished",
   "loop.failed",
+  "writer.started",
   "writer.completed",
   "writer.auto_wrapped",
+  "evalgen.started",
+  "evalgen.taxonomy_completed",
+  "evalgen.batch_completed",
+  "evalgen.topup_completed",
   "evalgen.completed",
   "iteration.started",
   "iteration.completed",
   "run.started",
   "run.completed",
+  "judge.started",
+  "optimizer.started",
   "optimizer.completed",
   "optimizer.noop",
 ];
@@ -158,6 +172,31 @@ function summarize(e: SSEMessage): string {
   }
   if (e.type === "evalgen.completed") {
     return `${e.n_train}+${e.n_holdout} items`;
+  }
+  if (e.type === "writer.started") {
+    return `${e.mode} · ${e.model}`;
+  }
+  if (e.type === "evalgen.started") {
+    const mode = e.mode ? `${e.mode} · ` : "";
+    return `${mode}${e.eval_size} items · ${e.model}`;
+  }
+  if (e.type === "evalgen.taxonomy_completed") {
+    return `${e.n_categories} categories`;
+  }
+  if (e.type === "evalgen.batch_completed") {
+    return `${e.category}: ${e.actual_count}/${e.target_count}`;
+  }
+  if (e.type === "evalgen.topup_completed") {
+    return `+${e.added} (asked ${e.requested})`;
+  }
+  if (e.type === "optimizer.started") {
+    return `${e.n_failure_samples} failures · ${e.model}`;
+  }
+  if (e.type === "judge.started") {
+    return `${e.split} · ${e.n_items} items · ${e.judge_model}`;
+  }
+  if (e.type === "run.started") {
+    return `${e.split} · ${e.target_model} · ${e.n_items} items`;
   }
   return "";
 }
