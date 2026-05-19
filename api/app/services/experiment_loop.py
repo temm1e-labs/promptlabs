@@ -634,15 +634,38 @@ async def run_experiment(
             all_items = list((await db.execute(items_stmt)).scalars().all())
             if not all_items:
                 declared = [v.name for v in writer_result.output.variables]
-                reason = (
-                    "EvalGen produced 0 usable items after reconciliation. "
-                    f"Declared variables: {declared}. "
-                    "Common causes: the agent model couldn't reliably fill all "
-                    "declared variables for multi-var prompts, or returned items "
-                    "with no input_text/input_vars at all. Try a more capable "
-                    "agent model (e.g. gemini-2.5-flash) or simplify the prompt "
-                    "template to fewer variables."
-                )
+                from app.core import template as _tmpl
+
+                detection = _tmpl.detect(writer_result.output.prompt)
+                detected_in_template = detection.variables
+                syntax = detection.syntax.value
+                if not declared and not detected_in_template:
+                    reason = (
+                        "EvalGen produced 0 usable items. No variable placeholders were "
+                        "detected in the prompt template. Add at least one placeholder "
+                        "such as {{user_input}}, {user_input}, ${user_input}, or "
+                        "%(user_input)s so test cases have something to substitute."
+                    )
+                elif not declared and detected_in_template:
+                    reason = (
+                        f"EvalGen produced 0 usable items. The template uses '{syntax}' "
+                        f"syntax with variables {detected_in_template}, but the writer "
+                        "agent declared none. This usually means the writer LLM missed "
+                        "the syntax; the auto-detector caught it but the experiment "
+                        "still needs declared variables with descriptions. Try re-running "
+                        "the experiment, or rewrite the prompt using {{var_name}} syntax."
+                    )
+                else:
+                    reason = (
+                        "EvalGen produced 0 usable items after reconciliation. "
+                        f"Declared variables: {declared}. Detected in template: "
+                        f"{detected_in_template} (syntax: {syntax}). "
+                        "Common causes: the agent model couldn't reliably fill all "
+                        "declared variables for multi-var prompts, or returned items "
+                        "with no input_text/input_vars at all. Try a more capable "
+                        "agent model (e.g. gemini-2.5-flash) or simplify the prompt "
+                        "template to fewer variables."
+                    )
                 await _set_status(db, experiment, ExperimentStatus.FAILED, reason)
                 await _emit(experiment_id, "loop.failed", error=reason)
                 return

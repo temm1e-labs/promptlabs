@@ -87,9 +87,16 @@ optimization loop. You DO NOT rewrite the prompt — the loop will do that.
 
 Your tasks:
 1. Return the user's prompt VERBATIM as `prompt`. Do not edit, reword, or normalize it.
-2. Extract every {{variable_name}} placeholder it already contains and declare each with a
-   description + realistic example value. If a placeholder uses spaces inside the braces,
-   ignore the spaces (extract the identifier inside).
+2. Extract every variable placeholder it contains and declare each with a description +
+   realistic example value. Supported placeholder syntaxes:
+     - {{variable_name}}    (Jinja2/Mustache/Handlebars)
+     - {variable_name}      (Python .format)
+     - ${variable_name}     (shell / JS template literal)
+     - %(variable_name)s    (Python old-style)
+   IMPORTANT: a {{...}} block whose contents look like JSON (multi-line, quoted keys,
+   colons, commas) is a SAMPLE OUTPUT EXAMPLE, not a variable — do NOT treat it as one.
+   Likewise, treat the prompt's described output schema as literal, not as variables.
+   If a placeholder name has surrounding whitespace, extract the identifier inside.
 3. If the prompt contains NO placeholders, you MUST still return the prompt verbatim AND
    declare an empty `variables` list — flag this in `assumptions` so the loop can wrap it.
 4. In `rationale`, briefly describe what the prompt is trying to do (your read of it).
