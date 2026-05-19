@@ -16,7 +16,7 @@ from app.core.sse import bus
 from app.models.evalset import EvalSet, Split
 from app.models.experiment import Experiment, ExperimentStatus
 from app.models.project import Project
-from app.models.prompt import PromptVersion
+from app.models.prompt import PromptSource, PromptVersion
 from app.models.run import Run, RunResult
 from app.schemas.experiment import ExperimentCreate, ExperimentOut, ExperimentSummary
 from app.services import experiment_loop
@@ -499,6 +499,120 @@ async def cancel_experiment(
     e.failure_reason = "cancelled by user"
     await db.flush()
     return _to_out(e)
+
+
+@router.post("/experiments/{experiment_id}/pause", response_model=ExperimentOut)
+async def pause_experiment(
+    experiment_id: str,
+    db: AsyncSession = Depends(get_session),
+) -> ExperimentOut:
+    """Cooperative pause: flip status to `paused`. The orchestrator checks at
+    iteration boundary and exits cleanly without marking terminal — /resume can
+    pick up later. In-flight LLM calls finish before the pause takes effect."""
+    e = await db.get(Experiment, experiment_id)
+    if e is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="experiment_not_found")
+    if e.status not in {ExperimentStatus.PENDING, ExperimentStatus.RUNNING}:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=f"cannot pause from status '{e.status.value}'",
+        )
+    e.status = ExperimentStatus.PAUSED
+    await db.flush()
+    return _to_out(e)
+
+
+@router.post("/experiments/{experiment_id}/resume", response_model=ExperimentOut)
+async def resume_experiment(
+    experiment_id: str,
+    db: AsyncSession = Depends(get_session),
+) -> ExperimentOut:
+    """Resume a paused experiment. Flips status PAUSED → RUNNING atomically and
+    spawns a background task that re-enters the iteration loop at
+    ``current_iteration + 1``. Writer + EvalGen phases are skipped — their
+    outputs are loaded from the DB."""
+    e = await db.get(Experiment, experiment_id)
+    if e is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="experiment_not_found")
+    if e.status != ExperimentStatus.PAUSED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=f"cannot resume from status '{e.status.value}' (must be 'paused')",
+        )
+    e.status = ExperimentStatus.RUNNING
+    await db.commit()  # commit BEFORE spawning so the task sees RUNNING
+    out = _to_out(e)
+
+    asyncio.create_task(  # noqa: RUF006 — background fire-and-forget
+        experiment_loop.resume_experiment(experiment_id)
+    )
+    return out
+
+
+@router.post(
+    "/experiments/{experiment_id}/clone",
+    response_model=ExperimentOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def clone_experiment(
+    experiment_id: str,
+    db: AsyncSession = Depends(get_session),
+) -> ExperimentOut:
+    """Create a new experiment with the same config as the source experiment
+    and immediately kick off the loop. Used by the Restart button.
+
+    The source's v0 prompt version determines the new experiment's mode:
+      - source v0.source == WARM → mode=warm, existing_prompt=v0.content
+      - source v0.source == COLD → mode=cold, existing_prompt=None
+    """
+    source = await db.get(Experiment, experiment_id)
+    if source is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="experiment_not_found")
+
+    # Determine mode + existing_prompt from the source's v0 (if any).
+    v0_stmt = (
+        select(PromptVersion)
+        .where(PromptVersion.experiment_id == source.id, PromptVersion.iteration == 0)
+        .limit(1)
+    )
+    v0 = (await db.execute(v0_stmt)).scalar_one_or_none()
+    if v0 is not None and v0.source == PromptSource.WARM:
+        mode = "warm"
+        existing_prompt: str | None = v0.content
+    else:
+        # COLD source, or no v0 persisted (very early failure) → cold mode.
+        mode = "cold"
+        existing_prompt = None
+
+    new_exp = Experiment(
+        project_id=source.project_id,
+        name=f"{source.name} (re-run)",
+        intent=source.intent,
+        requirements=source.requirements,
+        known_issues=source.known_issues if mode == "warm" else None,
+        optimization_objectives=list(source.optimization_objectives),
+        target_models=list(source.target_models),
+        agent_config=dict(source.agent_config or {}),
+        budget_usd=source.budget_usd,
+        max_iterations=source.max_iterations,
+        eval_size=source.eval_size,
+        train_ratio=source.train_ratio,
+        status=ExperimentStatus.PENDING,
+    )
+    db.add(new_exp)
+    await db.flush()
+    out = _to_out(new_exp)
+    await db.commit()
+
+    asyncio.create_task(  # noqa: RUF006 — background fire-and-forget
+        experiment_loop.run_experiment(
+            new_exp.id,
+            mode=mode,
+            existing_prompt=existing_prompt,
+        )
+    )
+
+    return out
 
 
 @router.delete("/experiments/{experiment_id}", status_code=status.HTTP_204_NO_CONTENT)

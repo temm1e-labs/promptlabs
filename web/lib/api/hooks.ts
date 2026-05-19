@@ -123,7 +123,9 @@ export function useExperiment(id: string) {
     refetchInterval: (query) => {
       const data = query.state.data;
       if (!data) return 2000;
-      return data.status === "running" || data.status === "pending" ? 2000 : false;
+      // Keep polling while running, pending, or paused (paused can resume → running).
+      const liveStatuses = ["running", "pending", "paused"];
+      return liveStatuses.includes(data.status) ? 2000 : false;
     },
   });
 }
@@ -151,6 +153,43 @@ export function useCancelExperiment(experimentId: string) {
       qc.invalidateQueries({ queryKey: ["experiments", experimentId] });
     },
     onError: (e) => toast.error(`Could not cancel: ${(e as Error).message}`),
+  });
+}
+
+export function usePauseExperiment(experimentId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<Experiment>(`/experiments/${experimentId}/pause`),
+    onSuccess: () => {
+      toast.success("Experiment paused — current step will finish then pause");
+      qc.invalidateQueries({ queryKey: ["experiments", experimentId] });
+    },
+    onError: (e) => toast.error(`Could not pause: ${(e as Error).message}`),
+  });
+}
+
+export function useResumeExperiment(experimentId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<Experiment>(`/experiments/${experimentId}/resume`),
+    onSuccess: () => {
+      toast.success("Experiment resumed");
+      qc.invalidateQueries({ queryKey: ["experiments", experimentId] });
+    },
+    onError: (e) => toast.error(`Could not resume: ${(e as Error).message}`),
+  });
+}
+
+export function useCloneExperiment(experimentId: string, projectId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<Experiment>(`/experiments/${experimentId}/clone`),
+    onSuccess: (cloned) => {
+      toast.success(`Restarted as ${cloned.name}`);
+      qc.invalidateQueries({ queryKey: ["projects", projectId, "experiments"] });
+      qc.invalidateQueries({ queryKey: ["experiments", "all"] });
+    },
+    onError: (e) => toast.error(`Could not restart: ${(e as Error).message}`),
   });
 }
 

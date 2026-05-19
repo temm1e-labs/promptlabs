@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useMemo } from "react";
-import { Square, Trash2 } from "lucide-react";
+import { Pause, Play, RotateCcw, Square, Trash2 } from "lucide-react";
 
 import { ScoreTrajectory, type TrajectoryPoint } from "@/components/charts/score-trajectory";
 import { TrainHoldoutGap, type GapPoint } from "@/components/charts/train-holdout-gap";
@@ -16,10 +16,13 @@ import { CodeBlock } from "@/components/ui/code-block";
 import { Separator } from "@/components/ui/separator";
 import {
   useCancelExperiment,
+  useCloneExperiment,
   useDeleteExperiment,
   useExperiment,
   useIterationStats,
+  usePauseExperiment,
   usePromptVersions,
+  useResumeExperiment,
   useRuns,
 } from "@/lib/api/hooks";
 import { formatCost, formatScore, scoreBand } from "@/lib/utils";
@@ -39,6 +42,15 @@ const STATUS_VARIANT: Record<ExperimentStatus, "default" | "good" | "mid" | "bad
 };
 
 const RUNNING_STATUSES: ExperimentStatus[] = ["pending", "running"];
+const PAUSABLE_STATUSES: ExperimentStatus[] = ["pending", "running"];
+const TERMINAL_STATUSES: ExperimentStatus[] = [
+  "converged",
+  "overfit",
+  "exhausted",
+  "failed",
+  "accepted",
+  "cancelled",
+];
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -50,13 +62,33 @@ export default function ExperimentPage() {
   const { data: runs } = useRuns(expId);
   const { data: stats } = useIterationStats(expId);
   const cancelMut = useCancelExperiment(expId);
+  const pauseMut = usePauseExperiment(expId);
+  const resumeMut = useResumeExperiment(expId);
+  const cloneMut = useCloneExperiment(expId, projectId);
   const deleteMut = useDeleteExperiment(expId, projectId);
   const isRunning = exp ? RUNNING_STATUSES.includes(exp.status) : false;
-  const canDelete = exp && !isRunning;
+  const isPausable = exp ? PAUSABLE_STATUSES.includes(exp.status) : false;
+  const isPaused = exp?.status === "paused";
+  const isTerminal = exp ? TERMINAL_STATUSES.includes(exp.status) : false;
+  const canDelete = exp && !isRunning && !isPaused;
 
   const onStop = async () => {
     if (!confirm("Stop this experiment? In-flight LLM calls will finish first.")) return;
     await cancelMut.mutateAsync();
+  };
+
+  const onPause = async () => {
+    await pauseMut.mutateAsync();
+  };
+
+  const onResume = async () => {
+    await resumeMut.mutateAsync();
+  };
+
+  const onRestart = async () => {
+    if (!confirm("Start a fresh run with the same config? This creates a new experiment.")) return;
+    const cloned = await cloneMut.mutateAsync();
+    router.push(`/projects/${projectId}/experiments/${cloned.id}`);
   };
 
   const onDelete = async () => {
@@ -136,15 +168,49 @@ export default function ExperimentPage() {
             <Stat label="cost" value={exp ? `${formatCost(exp.cost_usd)} / ${formatCost(exp.budget_usd)}` : "—"} />
             <Separator orientation="vertical" className="h-10" />
             {exp && <Badge variant={STATUS_VARIANT[exp.status]}>{exp.status}</Badge>}
-            {isRunning && (
+            {isPausable && (
               <Button
                 variant="outline"
                 size="sm"
+                onClick={onPause}
+                disabled={pauseMut.isPending}
+              >
+                <Pause className="h-3 w-3" />
+                {pauseMut.isPending ? "Pausing…" : "Pause"}
+              </Button>
+            )}
+            {isPaused && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onResume}
+                disabled={resumeMut.isPending}
+              >
+                <Play className="h-3 w-3" />
+                {resumeMut.isPending ? "Resuming…" : "Resume"}
+              </Button>
+            )}
+            {(isRunning || isPaused) && (
+              <Button
+                variant="ghost"
+                size="sm"
                 onClick={onStop}
                 disabled={cancelMut.isPending}
+                aria-label="Stop experiment"
               >
                 <Square className="h-3 w-3" />
                 {cancelMut.isPending ? "Stopping…" : "Stop"}
+              </Button>
+            )}
+            {isTerminal && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onRestart}
+                disabled={cloneMut.isPending}
+              >
+                <RotateCcw className="h-3 w-3" />
+                {cloneMut.isPending ? "Restarting…" : "Restart"}
               </Button>
             )}
             {canDelete && (

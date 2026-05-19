@@ -78,6 +78,20 @@ async def _check_cancelled(db: AsyncSession, experiment_id: str) -> bool:
     return current_status == ExperimentStatus.CANCELLED
 
 
+async def _check_paused(db: AsyncSession, experiment_id: str) -> bool:
+    """Re-query the experiment's status — true if user requested a pause.
+
+    Mirrors _check_cancelled. The loop checks at every iteration boundary and,
+    on PAUSED, exits cleanly without marking a terminal status (so /resume can
+    pick up later).
+    """
+    fresh = await db.execute(
+        select(Experiment.status).where(Experiment.id == experiment_id)
+    )
+    current_status = fresh.scalar_one_or_none()
+    return current_status == ExperimentStatus.PAUSED
+
+
 def _declare_user_input_if_no_variables(
     writer_result: WriterResult,
 ) -> tuple[WriterResult, bool]:
@@ -678,182 +692,25 @@ async def run_experiment(
             )
 
             # ── Phase 3: Iterate ────────────────────────────────────────
-            train_means: list[float] = []
-            holdout_means: list[float] = []
-            current_prompt_version = v0
-
-            judge_model = _agent_model(experiment, "judge")
-            optimizer_model = _agent_model(experiment, "optimizer")
-            final_status: ExperimentStatus = ExperimentStatus.EXHAUSTED
-
-            for iteration in range(1, experiment.max_iterations + 1):
-                if await _check_cancelled(db, experiment_id):
-                    await _emit(experiment_id, "loop.finished", status="cancelled")
-                    return
-                experiment.current_iteration = iteration
-                await db.commit()
-                await _emit(experiment_id, "iteration.started", iteration=iteration)
-
-                # 3a. Train pass — parallel fan-out across target models.
-                # Each call opens its own AsyncSession (sessions aren't task-safe).
-                train_results = await asyncio.gather(
-                    *[
-                        _execute_on_split(
-                            experiment_id=experiment_id,
-                            prompt_version_id=current_prompt_version.id,
-                            prompt_content=current_prompt_version.content,
-                            target_model=target_model,
-                            items=train_items,
-                            iteration=iteration,
-                            split=Split.TRAIN,
-                            rubric=rubric_dicts,
-                            judge_model=judge_model,
-                        )
-                        for target_model in experiment.target_models
-                    ]
-                )
-                iter_train_scores = [mean for _run, mean in train_results]
-                for _run, _ in train_results:
-                    ok = await _accumulate_cost(db, experiment, _run.cost_usd)
-                if not ok:
-                    await _set_status(
-                        db, experiment, ExperimentStatus.EXHAUSTED, "budget during train pass"
-                    )
-                    await _emit(experiment_id, "loop.finished", status=experiment.status.value)
-                    return
-                train_mean_iter = statistics.fmean(iter_train_scores) if iter_train_scores else 0.0
-                train_means.append(train_mean_iter)
-
-                # 3b. Optimize
-                samples = await _failure_samples_for_optimizer(db, experiment_id, iteration)
-                await _emit(
-                    experiment_id,
-                    "optimizer.started",
-                    iteration=iteration,
-                    model=optimizer_model,
-                    n_failure_samples=len(samples),
-                )
-                opt_result = await optimizer_agent.optimize(
-                    current_prompt=current_prompt_version.content,
-                    iteration=iteration,
-                    rubric=rubric_dicts,
-                    failure_samples=samples,
-                    objectives=list(experiment.optimization_objectives),
-                    known_issues=experiment.known_issues,
-                    model=optimizer_model,
-                )
-                ok = await _accumulate_cost(db, experiment, opt_result.cost_usd)
-
-                if opt_result.new_prompt == current_prompt_version.content:
-                    await _emit(
-                        experiment_id,
-                        "optimizer.noop",
-                        iteration=iteration,
-                        skip_reasons=opt_result.skip_reasons,
-                        cost_usd=opt_result.cost_usd,
-                    )
-                    final_status = ExperimentStatus.CONVERGED
-                    break
-
-                new_version = await _persist_prompt(
-                    db,
-                    experiment,
-                    iteration=iteration,
-                    content=opt_result.new_prompt,
-                    rationale=opt_result.summary,
-                    source=PromptSource.OPTIMIZER,
-                    parent_id=current_prompt_version.id,
-                    diff={
-                        "edits": [e.model_dump() for e in opt_result.edits],
-                        "applied": opt_result.edits_applied,
-                        "skipped": opt_result.edits_skipped,
-                        "skip_reasons": opt_result.skip_reasons,
-                    },
-                )
-                await db.commit()
-                await _emit(
-                    experiment_id,
-                    "optimizer.completed",
-                    iteration=iteration,
-                    new_prompt_version_id=new_version.id,
-                    edits_applied=opt_result.edits_applied,
-                    edits_skipped=opt_result.edits_skipped,
-                    cost_usd=opt_result.cost_usd,
-                )
-                if not ok:
-                    await _set_status(
-                        db, experiment, ExperimentStatus.EXHAUSTED, "budget after optimizer"
-                    )
-                    await _emit(experiment_id, "loop.finished", status=experiment.status.value)
-                    return
-
-                # 3c. Holdout pass on the new version — parallel fan-out
-                # (each call opens its own session, see _execute_on_split).
-                holdout_results = await asyncio.gather(
-                    *[
-                        _execute_on_split(
-                            experiment_id=experiment_id,
-                            prompt_version_id=new_version.id,
-                            prompt_content=new_version.content,
-                            target_model=target_model,
-                            items=holdout_items,
-                            iteration=iteration,
-                            split=Split.HOLDOUT,
-                            rubric=rubric_dicts,
-                            judge_model=judge_model,
-                        )
-                        for target_model in experiment.target_models
-                    ]
-                )
-                iter_holdout_scores = [mean for _run, mean in holdout_results]
-                for _run, _ in holdout_results:
-                    ok = await _accumulate_cost(db, experiment, _run.cost_usd)
-                if not ok:
-                    await _set_status(
-                        db, experiment, ExperimentStatus.EXHAUSTED, "budget during holdout"
-                    )
-                    await _emit(experiment_id, "loop.finished", status=experiment.status.value)
-                    return
-                holdout_mean_iter = (
-                    statistics.fmean(iter_holdout_scores) if iter_holdout_scores else 0.0
-                )
-                holdout_means.append(holdout_mean_iter)
-
-                await _emit(
-                    experiment_id,
-                    "iteration.completed",
-                    iteration=iteration,
-                    train_mean=train_mean_iter,
-                    holdout_mean=holdout_mean_iter,
-                    train_holdout_gap=train_mean_iter - holdout_mean_iter,
-                    cost_so_far=experiment.cost_usd,
-                )
-
-                current_prompt_version = new_version
-
-                # 3d. Convergence checks (sample-size aware)
-                if _overfitting(
-                    train_means,
-                    holdout_means,
-                    n_train=len(train_items),
-                    n_holdout=len(holdout_items),
-                ):
-                    final_status = ExperimentStatus.OVERFIT
-                    break
-                if _train_plateaued(train_means, n_train=len(train_items)):
-                    final_status = ExperimentStatus.CONVERGED
-                    break
-            else:
-                # max_iterations reached without break
-                final_status = ExperimentStatus.EXHAUSTED
-
-            await _set_status(db, experiment, final_status)
+            final_status = await _run_iterations(
+                db=db,
+                experiment=experiment,
+                current_prompt_version=v0,
+                train_items=train_items,
+                holdout_items=holdout_items,
+                rubric_dicts=rubric_dicts,
+                start_iteration=1,
+            )
+            if final_status in (ExperimentStatus.PAUSED, ExperimentStatus.CANCELLED):
+                # Already-emitted events; do NOT overwrite status with a terminal
+                # value (paused state must remain resumable; cancelled is final
+                # but already set by the user via the cancel endpoint).
+                return
+            await _set_status(db, experiment, final_status, experiment.failure_reason)
             await _emit(
                 experiment_id,
                 "loop.finished",
                 status=final_status.value,
-                train_means=train_means,
-                holdout_means=holdout_means,
                 final_iteration=experiment.current_iteration,
             )
         except Exception as exc:
@@ -866,3 +723,305 @@ async def run_experiment(
                     await on_finished()
                 except Exception as exc:
                     log.warning("loop.on_finished_callback_failed", error=str(exc)[:200])
+
+
+async def _run_iterations(
+    *,
+    db: AsyncSession,
+    experiment: Experiment,
+    current_prompt_version: PromptVersion,
+    train_items: list[EvalItem],
+    holdout_items: list[EvalItem],
+    rubric_dicts: list[dict[str, Any]],
+    start_iteration: int,
+) -> ExperimentStatus:
+    """Phase 3 of the loop: iterate train→optimize→holdout up to max_iterations.
+
+    Called by run_experiment for fresh runs (start_iteration=1) and by
+    resume_experiment for paused runs (start_iteration=current_iteration+1).
+
+    Returns the final ExperimentStatus. Special values:
+      - PAUSED: user paused mid-loop; status is already PAUSED in the DB and a
+        ``loop.paused`` event has been emitted. Caller must NOT mark terminal.
+      - CANCELLED: user cancelled; ``loop.finished`` event already emitted with
+        status=cancelled. Caller must NOT re-emit.
+      - CONVERGED / OVERFIT / EXHAUSTED: normal terminal; caller marks status
+        and emits ``loop.finished``.
+    """
+    experiment_id = experiment.id
+    train_means: list[float] = []
+    holdout_means: list[float] = []
+    judge_model = _agent_model(experiment, "judge")
+    optimizer_model = _agent_model(experiment, "optimizer")
+    final_status: ExperimentStatus = ExperimentStatus.EXHAUSTED
+
+    for iteration in range(start_iteration, experiment.max_iterations + 1):
+        if await _check_cancelled(db, experiment_id):
+            await _emit(experiment_id, "loop.finished", status="cancelled")
+            return ExperimentStatus.CANCELLED
+        if await _check_paused(db, experiment_id):
+            await _emit(
+                experiment_id,
+                "loop.paused",
+                iteration=iteration,
+                resumable_from=iteration,
+            )
+            return ExperimentStatus.PAUSED
+        experiment.current_iteration = iteration
+        await db.commit()
+        await _emit(experiment_id, "iteration.started", iteration=iteration)
+
+        # 3a. Train pass — parallel fan-out across target models.
+        # Each call opens its own AsyncSession (sessions aren't task-safe).
+        train_results = await asyncio.gather(
+            *[
+                _execute_on_split(
+                    experiment_id=experiment_id,
+                    prompt_version_id=current_prompt_version.id,
+                    prompt_content=current_prompt_version.content,
+                    target_model=target_model,
+                    items=train_items,
+                    iteration=iteration,
+                    split=Split.TRAIN,
+                    rubric=rubric_dicts,
+                    judge_model=judge_model,
+                )
+                for target_model in experiment.target_models
+            ]
+        )
+        iter_train_scores = [mean for _run, mean in train_results]
+        for _run, _ in train_results:
+            ok = await _accumulate_cost(db, experiment, _run.cost_usd)
+        if not ok:
+            experiment.failure_reason = "budget during train pass"
+            return ExperimentStatus.EXHAUSTED
+        train_mean_iter = statistics.fmean(iter_train_scores) if iter_train_scores else 0.0
+        train_means.append(train_mean_iter)
+
+        # 3b. Optimize
+        samples = await _failure_samples_for_optimizer(db, experiment_id, iteration)
+        await _emit(
+            experiment_id,
+            "optimizer.started",
+            iteration=iteration,
+            model=optimizer_model,
+            n_failure_samples=len(samples),
+        )
+        opt_result = await optimizer_agent.optimize(
+            current_prompt=current_prompt_version.content,
+            iteration=iteration,
+            rubric=rubric_dicts,
+            failure_samples=samples,
+            objectives=list(experiment.optimization_objectives),
+            known_issues=experiment.known_issues,
+            model=optimizer_model,
+        )
+        ok = await _accumulate_cost(db, experiment, opt_result.cost_usd)
+
+        if opt_result.new_prompt == current_prompt_version.content:
+            await _emit(
+                experiment_id,
+                "optimizer.noop",
+                iteration=iteration,
+                skip_reasons=opt_result.skip_reasons,
+                cost_usd=opt_result.cost_usd,
+            )
+            final_status = ExperimentStatus.CONVERGED
+            break
+
+        new_version = await _persist_prompt(
+            db,
+            experiment,
+            iteration=iteration,
+            content=opt_result.new_prompt,
+            rationale=opt_result.summary,
+            source=PromptSource.OPTIMIZER,
+            parent_id=current_prompt_version.id,
+            diff={
+                "edits": [e.model_dump() for e in opt_result.edits],
+                "applied": opt_result.edits_applied,
+                "skipped": opt_result.edits_skipped,
+                "skip_reasons": opt_result.skip_reasons,
+            },
+        )
+        await db.commit()
+        await _emit(
+            experiment_id,
+            "optimizer.completed",
+            iteration=iteration,
+            new_prompt_version_id=new_version.id,
+            edits_applied=opt_result.edits_applied,
+            edits_skipped=opt_result.edits_skipped,
+            cost_usd=opt_result.cost_usd,
+        )
+        if not ok:
+            experiment.failure_reason = "budget after optimizer"
+            return ExperimentStatus.EXHAUSTED
+
+        # 3c. Holdout pass on the new version — parallel fan-out
+        # (each call opens its own session, see _execute_on_split).
+        holdout_results = await asyncio.gather(
+            *[
+                _execute_on_split(
+                    experiment_id=experiment_id,
+                    prompt_version_id=new_version.id,
+                    prompt_content=new_version.content,
+                    target_model=target_model,
+                    items=holdout_items,
+                    iteration=iteration,
+                    split=Split.HOLDOUT,
+                    rubric=rubric_dicts,
+                    judge_model=judge_model,
+                )
+                for target_model in experiment.target_models
+            ]
+        )
+        iter_holdout_scores = [mean for _run, mean in holdout_results]
+        for _run, _ in holdout_results:
+            ok = await _accumulate_cost(db, experiment, _run.cost_usd)
+        if not ok:
+            experiment.failure_reason = "budget during holdout"
+            return ExperimentStatus.EXHAUSTED
+        holdout_mean_iter = (
+            statistics.fmean(iter_holdout_scores) if iter_holdout_scores else 0.0
+        )
+        holdout_means.append(holdout_mean_iter)
+
+        await _emit(
+            experiment_id,
+            "iteration.completed",
+            iteration=iteration,
+            train_mean=train_mean_iter,
+            holdout_mean=holdout_mean_iter,
+            train_holdout_gap=train_mean_iter - holdout_mean_iter,
+            cost_so_far=experiment.cost_usd,
+        )
+
+        current_prompt_version = new_version
+
+        # 3d. Convergence checks (sample-size aware)
+        if _overfitting(
+            train_means,
+            holdout_means,
+            n_train=len(train_items),
+            n_holdout=len(holdout_items),
+        ):
+            final_status = ExperimentStatus.OVERFIT
+            break
+        if _train_plateaued(train_means, n_train=len(train_items)):
+            final_status = ExperimentStatus.CONVERGED
+            break
+    else:
+        # max_iterations reached without break
+        final_status = ExperimentStatus.EXHAUSTED
+
+    return final_status
+
+
+async def _load_resume_state(
+    db: AsyncSession, experiment: Experiment
+) -> tuple[PromptVersion, list[EvalItem], list[EvalItem], list[dict[str, Any]]] | None:
+    """Load (current_prompt_version, train_items, holdout_items, rubric_dicts) from DB.
+
+    Returns None if any required state is missing (no prompt version persisted, no
+    eval set, etc.) — the caller should treat that as an unresumable experiment
+    and surface an error instead of silently restarting.
+    """
+    # Latest prompt version (highest iteration).
+    pv_stmt = (
+        select(PromptVersion)
+        .where(PromptVersion.experiment_id == experiment.id)
+        .order_by(PromptVersion.iteration.desc())
+        .limit(1)
+    )
+    current_prompt_version = (await db.execute(pv_stmt)).scalar_one_or_none()
+    if current_prompt_version is None:
+        return None
+
+    # EvalSet with rubric_criteria.
+    es_stmt = select(EvalSet).where(EvalSet.experiment_id == experiment.id)
+    eval_set = (await db.execute(es_stmt)).scalar_one_or_none()
+    if eval_set is None:
+        return None
+
+    # Eval items split by train/holdout.
+    items_stmt = (
+        select(EvalItem)
+        .where(EvalItem.eval_set_id == eval_set.id)
+        .order_by(EvalItem.created_at.asc())
+    )
+    all_items = list((await db.execute(items_stmt)).scalars().all())
+    if not all_items:
+        return None
+    train_items = [i for i in all_items if i.split == Split.TRAIN]
+    holdout_items = [i for i in all_items if i.split == Split.HOLDOUT]
+
+    return current_prompt_version, train_items, holdout_items, list(eval_set.rubric_criteria)
+
+
+async def resume_experiment(experiment_id: str) -> None:
+    """Background task entrypoint for /resume.
+
+    Loads the persisted state of a PAUSED experiment and re-enters Phase 3 at
+    ``current_iteration + 1``. Skips Writer + EvalGen entirely — they already
+    ran and their outputs (v0, eval set, rubric) are in the DB.
+
+    Note: per-iteration ``train_means``/``holdout_means`` accumulators start
+    fresh on resume. Convergence checks (which need 3 consecutive iterations)
+    therefore require 3 post-resume iterations to fire, not 3 across the
+    entire experiment's history. This is a deliberate simplification; the
+    persisted runs remain queryable via /iteration-stats either way.
+    """
+    async with SessionLocal() as db:
+        experiment = await _reload(db, experiment_id)
+        if experiment is None:
+            log.warning("loop.resume_experiment_not_found", id=experiment_id)
+            return
+        if experiment.status != ExperimentStatus.RUNNING:
+            # The /resume endpoint should have flipped to RUNNING before
+            # spawning this task. Bail rather than racing with a concurrent
+            # state change.
+            log.warning(
+                "loop.resume_unexpected_status",
+                id=experiment_id,
+                status=experiment.status.value,
+            )
+            return
+
+        try:
+            state = await _load_resume_state(db, experiment)
+            if state is None:
+                msg = "Resume failed: required state (prompt version / eval set / items) missing"
+                await _set_status(db, experiment, ExperimentStatus.FAILED, msg)
+                await _emit(experiment_id, "loop.failed", error=msg)
+                return
+            current_prompt_version, train_items, holdout_items, rubric_dicts = state
+            await _emit(
+                experiment_id,
+                "loop.resumed",
+                resume_iteration=experiment.current_iteration + 1,
+            )
+            final_status = await _run_iterations(
+                db=db,
+                experiment=experiment,
+                current_prompt_version=current_prompt_version,
+                train_items=train_items,
+                holdout_items=holdout_items,
+                rubric_dicts=rubric_dicts,
+                start_iteration=experiment.current_iteration + 1,
+            )
+            if final_status in (ExperimentStatus.PAUSED, ExperimentStatus.CANCELLED):
+                return
+            await _set_status(
+                db, experiment, final_status, experiment.failure_reason
+            )
+            await _emit(
+                experiment_id,
+                "loop.finished",
+                status=final_status.value,
+                final_iteration=experiment.current_iteration,
+            )
+        except Exception as exc:
+            log.exception("loop.resume_failed", id=experiment_id)
+            await _set_status(db, experiment, ExperimentStatus.FAILED, str(exc))
+            await _emit(experiment_id, "loop.failed", error=str(exc))
