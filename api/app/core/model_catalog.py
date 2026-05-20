@@ -24,6 +24,12 @@ DEFAULT_CATALOG: tuple[ModelEntry, ...] = (
     ModelEntry("openai/o5-mini", "o5 mini", "OpenAI", "o-series"),
     # Google
     ModelEntry(
+        "gemini/gemini-3.5-flash",
+        "Gemini 3.5 Flash",
+        "Google",
+        "gemini",
+    ),
+    ModelEntry(
         "gemini/gemini-3.1-pro-preview",
         "Gemini 3.1 Pro (preview)",
         "Google",

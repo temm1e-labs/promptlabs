@@ -14,6 +14,7 @@ def test_normalize_temperature_overrides_gemini_3_below_one() -> None:
     assert _normalize_temperature("gemini/gemini-3-flash-preview", 0.0) == 1.0
     assert _normalize_temperature("gemini/gemini-3-flash-preview", 0.7) == 1.0
     assert _normalize_temperature("gemini/gemini-3.1-pro-preview", 0.5) == 1.0
+    assert _normalize_temperature("gemini/gemini-3.5-flash", 0.5) == 1.0
     # Already at or above 1.0 — no change
     assert _normalize_temperature("gemini/gemini-3-flash-preview", 1.0) == 1.0
     assert _normalize_temperature("gemini/gemini-3-flash-preview", 1.5) == 1.5
